@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -12,6 +12,7 @@ import {
   resolveSqliteRuntimeCandidates,
   SqliteLcmStore,
 } from '../dist/store.js';
+import { withUnwritableFile } from './helpers.mjs';
 
 function makeWorkspace(prefix) {
   return mkdtempSync(path.join(tmpdir(), `${prefix}-`));
@@ -191,6 +192,7 @@ test('init reads an initialized store even when lcm.db is readonly', async () =>
   const workspace = makeWorkspace('lcm-schema-readonly');
   const dbPath = path.join(workspace, '.lcm', 'lcm.db');
   let store;
+  let restoreWritable;
 
   try {
     store = new SqliteLcmStore(workspace, makeOptions());
@@ -200,7 +202,7 @@ test('init reads an initialized store even when lcm.db is readonly', async () =>
     store.close();
     store = undefined;
 
-    chmodSync(dbPath, 0o444);
+    restoreWritable = withUnwritableFile(dbPath);
 
     store = new SqliteLcmStore(workspace, makeOptions());
     await store.init();
@@ -209,11 +211,7 @@ test('init reads an initialized store even when lcm.db is readonly', async () =>
     assert.equal(stats.schemaVersion, 2);
   } finally {
     store?.close();
-
-    if (existsSync(dbPath)) {
-      chmodSync(dbPath, 0o666);
-    }
-
+    restoreWritable?.();
     await cleanupWorkspace(workspace);
   }
 });
@@ -226,6 +224,7 @@ test('capture falls back to a user-writable store when the default lcm.db is rea
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
   let store;
+  let restoreWritable;
 
   try {
     process.env.HOME = homeDir;
@@ -241,7 +240,7 @@ test('capture falls back to a user-writable store when the default lcm.db is rea
     store.close();
     store = undefined;
 
-    chmodSync(dbPath, 0o444);
+    restoreWritable = withUnwritableFile(dbPath);
 
     store = new SqliteLcmStore(workspace, makeOptions({ storeDir: undefined }));
     await store.init();
@@ -291,9 +290,7 @@ test('capture falls back to a user-writable store when the default lcm.db is rea
       process.env.USERPROFILE = originalUserProfile;
     }
 
-    if (existsSync(dbPath)) {
-      chmodSync(dbPath, 0o666);
-    }
+    restoreWritable?.();
 
     await cleanupWorkspace(workspace);
     await cleanupWorkspace(homeDir);

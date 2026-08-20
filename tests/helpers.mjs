@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -53,6 +54,43 @@ export async function cleanupWorkspace(workspace) {
       await new Promise((resolve) => setTimeout(resolve, 100 * 2 ** (attempt - 1)));
     }
   }
+}
+
+/**
+ * Make `file` unwritable for THIS process, then restore it.
+ *
+ * `chmod 0o444` is not enough under uid 0: the kernel's `DAC_OVERRIDE` lets root
+ * write any file regardless of mode, so the store never sees the `EACCES`/`EPERM`/
+ * `EROFS` or `attempt to write a readonly database` error its fallback keys on
+ * (src/store.ts:771-781) and the test silently exercises nothing. As root the
+ * immutable attribute is used instead, which the kernel enforces for every uid.
+ *
+ * Returns a restore function. Callers MUST invoke it in `finally`, otherwise an
+ * immutable file cannot be unlinked and workspace cleanup fails.
+ */
+export function withUnwritableFile(file) {
+  if (process.getuid?.() !== 0) {
+    chmodSync(file, 0o444);
+    return () => {
+      if (existsSync(file)) chmodSync(file, 0o666);
+    };
+  }
+
+  try {
+    execFileSync('chattr', ['+i', file], { stdio: 'pipe' });
+  } catch (error) {
+    // ext4/xfs support this; tmpfs and overlayfs may not.
+    throw new Error(
+      `cannot make ${file} unwritable as root: chattr +i failed (${error.message}). ` +
+        'Run this test as an unprivileged user or on a filesystem supporting immutability.',
+    );
+  }
+
+  return () => {
+    if (!existsSync(file)) return;
+    execFileSync('chattr', ['-i', file], { stdio: 'pipe' });
+    chmodSync(file, 0o666);
+  };
 }
 
 export function makeOptions(overrides = {}) {

@@ -128,10 +128,14 @@ bun run lint
 bun run test
 ```
 
-One test — `capture falls back to a user-writable store when the default lcm.db
-is readonly` — fails when the suite runs as root, because `chmod 444` does not
-block writes for uid 0 and the test's premise cannot hold. It passes as an
-unprivileged user.
+The suite passes as root and as an unprivileged user. Tests that need an
+unwritable database go through `withUnwritableFile` in `tests/helpers.mjs`:
+`chmod 0o444` does not block uid 0, since `DAC_OVERRIDE` lets root write any file
+regardless of mode, so as root the helper sets the immutable attribute
+(`chattr +i`) instead — the kernel enforces that for every uid. On a filesystem
+without immutability support (some tmpfs/overlayfs mounts) those two tests fail
+with an explicit message rather than passing vacuously; run them as an
+unprivileged user there.
 
 ## License
 
