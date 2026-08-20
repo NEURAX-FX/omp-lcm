@@ -1,0 +1,6291 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import path from 'node:path';
+
+import type { Event, Message, Part } from '@opencode-ai/sdk';
+
+import {
+  buildActiveSummaryText,
+  renderAutomaticRetrievalContext,
+  resolveArchiveTransformWindow,
+  selectAutomaticRetrievalHits,
+} from './archive-transform.js';
+import {
+  AUTOMATIC_RETRIEVAL_QUERY_TOKENS,
+  AUTOMATIC_RETRIEVAL_QUERY_VARIANTS,
+  AUTOMATIC_RETRIEVAL_RECENT_MESSAGES,
+  EXPAND_MESSAGE_LIMIT,
+  STORE_SCHEMA_VERSION,
+  SUMMARY_BRANCH_FACTOR,
+  SUMMARY_LEAF_MESSAGES,
+  SUMMARY_NODE_CHAR_LIMIT,
+} from './constants.js';
+import { type DoctorReport, type DoctorSessionIssue, formatDoctorReport } from './doctor.js';
+import { getLogger, isStartupLoggingEnabled } from './logging.js';
+import {
+  type CompiledPrivacyOptions,
+  compilePrivacyOptions,
+  redactStructuredValue,
+  redactText,
+} from './privacy.js';
+import { safeQuery, safeQueryOne, validateRow, withTransaction } from './sql-utils.js';
+import {
+  type ArtifactData,
+  buildArtifactSearchContent as buildArtifactSearchContentModule,
+  type ExternalizedMessage,
+  type ExternalizedSession,
+  externalizeMessage as externalizeMessageModule,
+  externalizeSession as externalizeSessionModule,
+  formatArtifactMetadataLines as formatArtifactMetadataLinesModule,
+  materializeArtifactRow as materializeArtifactRowModule,
+  persistStoredSessionSync as persistStoredSessionSyncModule,
+  replaceStoredMessageSync as replaceStoredMessageSyncModule,
+} from './store-artifacts.js';
+import {
+  buildFtsQuery,
+  filterTokensByTfidf,
+  refreshSearchIndexesSync as refreshSearchIndexesModule,
+  replaceMessageSearchRowSync as replaceMessageSearchRowModule,
+  replaceMessageSearchRowsSync as replaceMessageSearchRowsModule,
+  searchByScan as searchByScanModule,
+  searchWithFts as searchWithFtsModule,
+} from './store-search.js';
+import {
+  type ArtifactBlobRow,
+  type ArtifactRow,
+  exportStoreSnapshot,
+  importStoreSnapshot,
+  type MessageRow,
+  type PartRow,
+  type SessionRow,
+  type SnapshotScope,
+  type SnapshotWorktreeMode,
+  type SummaryEdgeRow,
+  type SummaryNodeRow,
+  type SummaryStateRow,
+} from './store-snapshot.js';
+import type {
+  AutomaticRetrievalDebugInfo,
+  CapturedEvent,
+  ConversationMessage,
+  NormalizedSession,
+  OpencodeLcmOptions,
+  ScopeName,
+  SearchResult,
+  StoreStats,
+  SummaryStrategyName,
+} from './types.js';
+import {
+  asRecord,
+  clamp,
+  filterIntentTokens,
+  firstFiniteNumber,
+  formatRetentionDays,
+  hashContent,
+  isAutomaticRetrievalNoise,
+  parseJson,
+  parseJsonSafe,
+  sanitizeAutomaticRetrievalSourceText,
+  shortNodeID,
+  shouldSuppressLowSignalAutomaticRetrievalAnchor,
+  tokenizeQuery,
+  truncate,
+} from './utils.js';
+import { normalizeWorktreeKey } from './worktree-key.js';
+
+type ResumeMap = Record<string, string>;
+
+type SummaryNodeData = {
+  nodeID: string;
+  sessionID: string;
+  level: number;
+  nodeKind: 'leaf' | 'internal';
+  startIndex: number;
+  endIndex: number;
+  messageIDs: string[];
+  summaryText: string;
+  strategy: SummaryStrategyName;
+  createdAt: number;
+};
+
+export type SessionReadRow = {
+  session_id: string;
+  title: string | null;
+  parent_session_id: string | null;
+  root_session_id: string | null;
+  lineage_depth: number | null;
+  session_directory: string | null;
+  worktree_key: string | null;
+  pinned: number;
+  pin_reason: string | null;
+  deleted: number;
+  updated_at: number;
+  created_at: number;
+  event_count: number;
+};
+
+export type MessageReadRow = {
+  session_id: string;
+  message_id: string;
+  role: string;
+  created_at: number;
+};
+
+export type PartReadRow = {
+  session_id: string;
+  message_id: string;
+  part_id: string;
+  part_type: string;
+  sort_key: number;
+  state_json: string;
+  created_at: number;
+};
+
+export type ArtifactReadRow = {
+  artifact_id: string;
+  session_id: string;
+  message_id: string;
+  part_id: string;
+  artifact_kind: string;
+  field_name: string;
+  content_hash: string | null;
+  preview_text: string;
+  metadata_json: string;
+  char_count: number;
+  created_at: number;
+};
+
+export type ArtifactBlobReadRow = {
+  content_hash: string;
+  content_text: string;
+  char_count: number;
+  created_at: number;
+};
+
+import type {
+  ResolvedRetentionPolicy,
+  RetentionBlobCandidate,
+  RetentionSessionCandidate,
+} from './store-retention.js';
+import type { SqlDatabaseLike, SqlStatementLike } from './store-types.js';
+
+function readSchemaVersionSync(db: SqlDatabaseLike): number {
+  const result = db.prepare('PRAGMA user_version').get() as Record<string, unknown> | undefined;
+  if (!result || typeof result !== 'object') return 0;
+  for (const value of Object.values(result)) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+
+function assertSupportedSchemaVersionSync(db: SqlDatabaseLike, maxVersion: number): void {
+  const schemaVersion = readSchemaVersionSync(db);
+  if (schemaVersion <= maxVersion) return;
+  throw new Error(
+    `Unsupported store schema version: ${schemaVersion}. This build supports up to ${maxVersion}.`,
+  );
+}
+
+function writeSchemaVersionSync(db: SqlDatabaseLike, version: number): void {
+  db.exec(`PRAGMA user_version = ${Math.max(0, Math.trunc(version))}`);
+}
+
+function readSessionHeader(db: SqlDatabaseLike, sessionID: string): SessionReadRow | undefined {
+  return db.prepare('SELECT * FROM sessions WHERE session_id = ?').get(sessionID) as
+    | SessionReadRow
+    | undefined;
+}
+
+function readAllSessions(db: SqlDatabaseLike): SessionReadRow[] {
+  return db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC').all() as SessionReadRow[];
+}
+
+function readChildSessions(db: SqlDatabaseLike, parentSessionID: string): SessionReadRow[] {
+  return db
+    .prepare('SELECT * FROM sessions WHERE parent_session_id = ? ORDER BY updated_at DESC')
+    .all(parentSessionID) as SessionReadRow[];
+}
+
+function readLineageChain(db: SqlDatabaseLike, sessionID: string): SessionReadRow[] {
+  const chain: SessionReadRow[] = [];
+  let current = readSessionHeader(db, sessionID);
+  while (current) {
+    chain.unshift(current);
+    const parentID = current.parent_session_id;
+    if (!parentID) break;
+    current = readSessionHeader(db, parentID);
+  }
+  return chain;
+}
+
+function readMessagesForSession(db: SqlDatabaseLike, sessionID: string): MessageReadRow[] {
+  return db
+    .prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC')
+    .all(sessionID) as MessageReadRow[];
+}
+
+function _readPartsForSession(db: SqlDatabaseLike, sessionID: string): PartReadRow[] {
+  return db
+    .prepare('SELECT * FROM parts WHERE session_id = ? ORDER BY message_id ASC, sort_key ASC')
+    .all(sessionID) as PartReadRow[];
+}
+
+function readArtifactsForSession(db: SqlDatabaseLike, sessionID: string): ArtifactReadRow[] {
+  return db
+    .prepare('SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at DESC')
+    .all(sessionID) as ArtifactReadRow[];
+}
+
+function readArtifact(db: SqlDatabaseLike, artifactID: string): ArtifactReadRow | undefined {
+  return db.prepare('SELECT * FROM artifacts WHERE artifact_id = ?').get(artifactID) as
+    | ArtifactReadRow
+    | undefined;
+}
+
+function readArtifactBlob(
+  db: SqlDatabaseLike,
+  contentHash: string,
+): ArtifactBlobReadRow | undefined {
+  return db.prepare('SELECT * FROM artifact_blobs WHERE content_hash = ?').get(contentHash) as
+    | ArtifactBlobReadRow
+    | undefined;
+}
+
+function _readOrphanArtifactBlobRows(db: SqlDatabaseLike): ArtifactBlobReadRow[] {
+  return db
+    .prepare(
+      `SELECT b.* FROM artifact_blobs b
+       WHERE NOT EXISTS (
+         SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+       )
+       ORDER BY b.created_at ASC`,
+    )
+    .all() as ArtifactBlobReadRow[];
+}
+
+function readLatestSessionID(db: SqlDatabaseLike): string | undefined {
+  const row = db
+    .prepare('SELECT session_id FROM sessions ORDER BY updated_at DESC LIMIT 1')
+    .get() as { session_id: string } | undefined;
+  return row?.session_id;
+}
+
+function readSessionStats(db: SqlDatabaseLike): {
+  sessionCount: number;
+  messageCount: number;
+  artifactCount: number;
+  summaryNodeCount: number;
+  blobCount: number;
+  orphanBlobCount: number;
+  orphanBlobChars: number;
+} {
+  const sessions = db.prepare('SELECT COUNT(*) AS count FROM sessions').get() as { count: number };
+  const messages = db.prepare('SELECT COUNT(*) AS count FROM messages').get() as { count: number };
+  const artifacts = db.prepare('SELECT COUNT(*) AS count FROM artifacts').get() as {
+    count: number;
+  };
+  const summaryNodes = db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get() as {
+    count: number;
+  };
+  const blobs = db
+    .prepare(
+      `SELECT COUNT(*) AS count, COALESCE(SUM(char_count), 0) AS chars
+       FROM artifact_blobs b
+       WHERE NOT EXISTS (
+         SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+       )`,
+    )
+    .get() as { count: number; chars: number };
+  return {
+    sessionCount: sessions.count,
+    messageCount: messages.count,
+    artifactCount: artifacts.count,
+    summaryNodeCount: summaryNodes.count,
+    blobCount: blobs.count,
+    orphanBlobCount: blobs.count,
+    orphanBlobChars: blobs.chars,
+  };
+}
+
+function extractSessionID(event: unknown): string | undefined {
+  const record = asRecord(event);
+  if (!record) return undefined;
+
+  if (typeof record.sessionID === 'string') return record.sessionID;
+
+  const properties = asRecord(record.properties);
+  if (!properties) return undefined;
+
+  if (typeof properties.sessionID === 'string') return properties.sessionID;
+
+  const info = asRecord(properties.info);
+  if (info && typeof info.sessionID === 'string') return info.sessionID;
+
+  const part = asRecord(properties.part);
+  if (part && typeof part.sessionID === 'string') return part.sessionID;
+
+  return undefined;
+}
+
+function extractTimestamp(event: unknown): number {
+  const record = asRecord(event);
+  if (!record) return Date.now();
+
+  const properties = asRecord(record.properties);
+  const time = asRecord(properties?.time);
+
+  if (typeof record.timestamp === 'number') return record.timestamp;
+  if (typeof properties?.timestamp === 'number') return properties.timestamp;
+  if (typeof time?.created === 'number') return time.created;
+  if (typeof properties?.time === 'number') return properties.time;
+
+  return Date.now();
+}
+
+type MessageValidationContext = {
+  operation: string;
+  sessionID?: string;
+  eventType?: string;
+};
+
+function logMalformedMessage(
+  message: string,
+  context: MessageValidationContext,
+  extra?: Record<string, unknown>,
+): void {
+  getLogger().warn(message, {
+    operation: context.operation,
+    sessionID: context.sessionID,
+    eventType: context.eventType,
+    ...extra,
+  });
+}
+
+function getValidMessageInfo(info: unknown): Message | undefined {
+  const record = asRecord(info);
+  if (!record) return undefined;
+
+  const time = asRecord(record.time);
+  if (
+    typeof record.id !== 'string' ||
+    typeof record.sessionID !== 'string' ||
+    typeof record.role !== 'string' ||
+    typeof time?.created !== 'number' ||
+    !Number.isFinite(time.created)
+  ) {
+    return undefined;
+  }
+
+  return info as Message;
+}
+
+function filterValidConversationMessages(
+  messages: ConversationMessage[],
+  context?: MessageValidationContext,
+): ConversationMessage[] {
+  if (context?.operation === 'transformMessages') return messages;
+  const valid = messages.filter((message) => Boolean(getValidMessageInfo(message?.info)));
+  const dropped = messages.length - valid.length;
+  if (dropped > 0 && context) {
+    logMalformedMessage('Skipping malformed conversation messages', context, { dropped });
+  }
+  return valid;
+}
+
+function parseStoredPart(
+  row: Pick<PartRow, 'session_id' | 'message_id' | 'part_id' | 'part_json'>,
+  operation: string,
+): Part | undefined {
+  return parseJsonSafe<Part>(row.part_json, (error, preview) => {
+    logMalformedMessage(
+      'Skipping corrupted stored part',
+      { operation, sessionID: row.session_id },
+      {
+        messageID: row.message_id,
+        partID: row.part_id,
+        error: error.message,
+        preview,
+      },
+    );
+  });
+}
+
+function parseStoredMessageInfo(
+  row: Pick<MessageRow, 'session_id' | 'message_id' | 'info_json'>,
+  operation: string,
+): Message | undefined {
+  const info = parseJsonSafe<Message>(row.info_json, (error, preview) => {
+    logMalformedMessage(
+      'Skipping corrupted stored message',
+      { operation, sessionID: row.session_id },
+      {
+        messageID: row.message_id,
+        error: error.message,
+        preview,
+      },
+    );
+  });
+  if (!info) return undefined;
+  if (!getValidMessageInfo(info)) {
+    logMalformedMessage(
+      'Skipping malformed stored message',
+      {
+        operation,
+        sessionID: row.session_id,
+      },
+      { messageID: row.message_id },
+    );
+    return undefined;
+  }
+  return info;
+}
+
+function parseArtifactMetadata(
+  row: Pick<ArtifactRow, 'artifact_id' | 'session_id' | 'message_id' | 'part_id' | 'metadata_json'>,
+  operation: string,
+): Record<string, unknown> {
+  return (
+    parseJsonSafe<Record<string, unknown>>(row.metadata_json || '{}', (error, preview) => {
+      getLogger().warn('Corrupted artifact metadata ignored', {
+        operation,
+        sessionID: row.session_id,
+        messageID: row.message_id,
+        partID: row.part_id,
+        artifactID: row.artifact_id,
+        error: error.message,
+        preview,
+      });
+    }) ?? {}
+  );
+}
+function isValidMessagePartUpdate(event: Event): boolean {
+  if (event.type !== 'message.part.updated') return false;
+  const part = asRecord(event.properties.part);
+  if (!part) return false;
+  return (
+    typeof part.id === 'string' &&
+    typeof part.messageID === 'string' &&
+    typeof part.sessionID === 'string'
+  );
+}
+
+function normalizeEvent(event: unknown): CapturedEvent | null {
+  const record = asRecord(event);
+  if (!record || typeof record.type !== 'string') return null;
+
+  return {
+    id: randomUUID(),
+    type: record.type,
+    sessionID: extractSessionID(event),
+    timestamp: extractTimestamp(event),
+    payload: event,
+  };
+}
+
+function getDeferredPartUpdateKey(event: Event): string | undefined {
+  if (event.type !== 'message.part.updated') return undefined;
+  return `${event.properties.part.sessionID}:${event.properties.part.messageID}:${event.properties.part.id}`;
+}
+
+function messageCreatedAt(message: ConversationMessage | undefined): number {
+  const created = message?.info?.time?.created;
+  return typeof created === 'number' && Number.isFinite(created) ? created : 0;
+}
+
+function messageParts(message: ConversationMessage | undefined): Part[] {
+  return Array.isArray(message?.parts) ? message.parts : [];
+}
+
+function signatureString(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function compareMessages(a: ConversationMessage, b: ConversationMessage): number {
+  return messageCreatedAt(a) - messageCreatedAt(b);
+}
+
+function emptySession(sessionID: string): NormalizedSession {
+  return {
+    sessionID,
+    updatedAt: 0,
+    eventCount: 0,
+    messages: [],
+  };
+}
+
+function buildSummaryNodeID(sessionID: string, level: number, slot: number): string {
+  return `sum_${hashContent(`summary:${sessionID}`).slice(0, 12)}_l${level}_p${slot}`;
+}
+
+function hydratePartFromArtifacts(part: Part, artifacts: ArtifactData[]): void {
+  for (const artifact of artifacts) {
+    switch (part.type) {
+      case 'text':
+      case 'reasoning':
+        if (artifact.fieldName === 'text') part.text = artifact.contentText;
+        break;
+      case 'tool':
+        if (part.state.status === 'completed' && artifact.fieldName === 'output')
+          part.state.output = artifact.contentText;
+        if (part.state.status === 'error' && artifact.fieldName === 'error')
+          part.state.error = artifact.contentText;
+        if (
+          part.state.status === 'completed' &&
+          artifact.fieldName.startsWith('attachment_text:')
+        ) {
+          const index = Number(artifact.fieldName.split(':')[1]);
+          const attachment = part.state.attachments?.[index];
+          if (attachment?.source?.text) {
+            attachment.source.text.value = artifact.contentText;
+            attachment.source.text.start = 0;
+            attachment.source.text.end = artifact.contentText.length;
+          }
+        }
+        break;
+      case 'file':
+        if (artifact.fieldName === 'source' && part.source?.text) {
+          part.source.text.value = artifact.contentText;
+          part.source.text.start = 0;
+          part.source.text.end = artifact.contentText.length;
+        }
+        break;
+      case 'snapshot':
+        if (artifact.fieldName === 'snapshot') part.snapshot = artifact.contentText;
+        break;
+      case 'agent':
+        if (artifact.fieldName === 'source' && part.source) {
+          part.source.value = artifact.contentText;
+          part.source.start = 0;
+          part.source.end = artifact.contentText.length;
+        }
+        break;
+      case 'subtask':
+        if (artifact.fieldName === 'prompt') part.prompt = artifact.contentText;
+        if (artifact.fieldName === 'description') part.description = artifact.contentText;
+        break;
+      default:
+        break;
+    }
+  }
+}
+
+function isSyntheticLcmTextPart(part: Part, markers?: string[]): boolean {
+  if (part.type !== 'text') return false;
+  const marker = part.metadata?.opencodeLcm;
+  if (typeof marker !== 'string') return false;
+  return markers ? markers.includes(marker) : true;
+}
+
+function guessMessageText(message: ConversationMessage, ignoreToolPrefixes: string[]): string {
+  const segments: string[] = [];
+
+  for (const part of messageParts(message)) {
+    switch (part.type) {
+      case 'text': {
+        if (isSyntheticLcmTextPart(part, ['archive-summary', 'retrieved-context', 'archived-part']))
+          break;
+        const text = typeof part.text === 'string' ? part.text : '';
+        if (text.startsWith('[Archived by opencode-lcm:')) break;
+        const sanitized = sanitizeAutomaticRetrievalSourceText(text);
+        if (sanitized) segments.push(sanitized);
+        break;
+      }
+      case 'reasoning': {
+        const text = typeof part.text === 'string' ? part.text : '';
+        if (text.startsWith('[Archived by opencode-lcm:')) break;
+        const sanitized = sanitizeAutomaticRetrievalSourceText(text);
+        if (sanitized) segments.push(sanitized);
+        break;
+      }
+      case 'file': {
+        const sourcePath = part.source?.path;
+        const filename = part.filename;
+        const inlineText = part.source?.text?.value;
+        segments.push([sourcePath ?? filename ?? 'file', inlineText].filter(Boolean).join(': '));
+        break;
+      }
+      case 'tool': {
+        const toolName = typeof part.tool === 'string' ? part.tool : '';
+        if (ignoreToolPrefixes.some((prefix) => toolName.startsWith(prefix))) break;
+        const state = part.state;
+        if (state.status === 'completed') segments.push(`${toolName}: ${state.output}`);
+        if (state.status === 'error') segments.push(`${toolName}: ${state.error}`);
+        if (state.status === 'pending' || state.status === 'running') {
+          segments.push(`${toolName}: ${JSON.stringify(state.input)}`);
+        }
+        if (state.status === 'completed' && state.attachments && state.attachments.length > 0) {
+          const attachmentNames = state.attachments
+            .map((file) => file.source?.path ?? file.filename ?? file.url)
+            .filter(Boolean)
+            .slice(0, 4);
+          if (attachmentNames.length > 0)
+            segments.push(`${toolName} attachments: ${attachmentNames.join(', ')}`);
+        }
+        break;
+      }
+      case 'subtask':
+        segments.push(`${part.agent}: ${part.description}`);
+        break;
+      case 'agent':
+        segments.push(part.name);
+        break;
+      case 'snapshot':
+        segments.push(part.snapshot);
+        break;
+      default:
+        break;
+    }
+  }
+
+  return truncate(segments.filter(Boolean).join('\n').replace(/\s+/g, ' ').trim(), 500);
+}
+
+function listFiles(message: ConversationMessage): string[] {
+  const files = new Set<string>();
+
+  for (const part of message.parts) {
+    if (part.type === 'file') {
+      if (part.source?.path) files.add(part.source.path);
+      else if (part.filename) files.add(part.filename);
+    }
+
+    if (part.type === 'patch') {
+      for (const file of part.files.slice(0, 20)) files.add(file);
+    }
+  }
+
+  return [...files];
+}
+
+function makeSessionTitle(session: NormalizedSession): string | undefined {
+  if (session.title) return session.title;
+
+  const firstUser = session.messages.find(
+    (message) => getValidMessageInfo(message.info)?.role === 'user',
+  );
+  if (!firstUser) return undefined;
+
+  return truncate(guessMessageText(firstUser, []), 80);
+}
+
+function archivePlaceholder(label: string): string {
+  return `[Archived by opencode-lcm: ${label}. Use lcm_resume, lcm_grep, or lcm_expand for details.]`;
+}
+
+function logStartupPhase(phase: string, context?: Record<string, unknown>): void {
+  if (!isStartupLoggingEnabled()) return;
+  getLogger().info(`startup phase: ${phase}`, context);
+}
+
+function unrefTimer(timer: ReturnType<typeof setTimeout> | undefined): void {
+  if (typeof timer === 'object' && timer && 'unref' in timer && typeof timer.unref === 'function') {
+    timer.unref();
+  }
+}
+
+type SqliteRuntime = 'bun' | 'node';
+type SqliteRuntimeOptions = {
+  envOverride?: string | undefined;
+  isBunRuntime?: boolean;
+  platform?: string | undefined;
+};
+type CaptureHydrationMode = 'full' | 'targeted';
+type CaptureHydrationOptions = {
+  isBunRuntime?: boolean;
+  platform?: string | undefined;
+};
+type ReadMessageOptions = {
+  hydrateArtifacts?: boolean;
+};
+
+function normalizeSqliteRuntimeOverride(value: string | undefined): SqliteRuntime | 'auto' {
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === 'bun' || normalized === 'node') return normalized;
+  return 'auto';
+}
+
+export function resolveSqliteRuntimeCandidates(options?: SqliteRuntimeOptions): SqliteRuntime[] {
+  const override = normalizeSqliteRuntimeOverride(
+    options?.envOverride ?? process.env.OPENCODE_LCM_SQLITE_RUNTIME,
+  );
+  if (override !== 'auto') return [override];
+
+  const isBunRuntime =
+    options?.isBunRuntime ?? (typeof globalThis === 'object' && 'Bun' in globalThis);
+  if (!isBunRuntime) return ['node'];
+
+  const platform = options?.platform ?? process.platform;
+  return platform === 'win32' ? ['node', 'bun'] : ['bun', 'node'];
+}
+
+export function resolveSqliteRuntime(options?: SqliteRuntimeOptions): SqliteRuntime {
+  return resolveSqliteRuntimeCandidates(options)[0];
+}
+
+export function resolveCaptureHydrationMode(
+  options?: CaptureHydrationOptions,
+): CaptureHydrationMode {
+  const isBunRuntime =
+    options?.isBunRuntime ?? (typeof globalThis === 'object' && 'Bun' in globalThis);
+  const platform = options?.platform ?? process.platform;
+
+  // The targeted fresh-tail capture path is safe under Node, but the bundled
+  // Bun runtime on Windows has been the only environment where users have
+  // reported native crashes in this hot path. Keep the older full-session
+  // hydration there until Bun/Windows is proven stable again.
+  return isBunRuntime && platform === 'win32' ? 'full' : 'targeted';
+}
+
+function shouldUseLightweightPartCapture(
+  event: CapturedEvent,
+  options?: CaptureHydrationOptions,
+): boolean {
+  const isBunRuntime =
+    options?.isBunRuntime ?? (typeof globalThis === 'object' && 'Bun' in globalThis);
+  const platform = options?.platform ?? process.platform;
+  if (!isBunRuntime || platform !== 'win32') return false;
+  return event.type === 'message.part.updated' || event.type === 'message.part.removed';
+}
+
+function isSqliteRuntimeImportError(runtime: SqliteRuntime, error: unknown): boolean {
+  const code =
+    typeof error === 'object' && error && 'code' in error && typeof error.code === 'string'
+      ? error.code
+      : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  const specifier = runtime === 'bun' ? 'bun:sqlite' : 'node:sqlite';
+
+  if (!message.includes(specifier)) return false;
+  if (code === 'ERR_UNKNOWN_BUILTIN_MODULE' || code === 'ERR_MODULE_NOT_FOUND') return true;
+
+  return (
+    message.includes('Cannot find module') ||
+    message.includes('Cannot find package') ||
+    message.includes('No such built-in module')
+  );
+}
+
+function hasErrorCode(error: unknown, code: string): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === code;
+}
+
+function isFilesystemWriteError(error: unknown): boolean {
+  return (
+    hasErrorCode(error, 'EACCES') || hasErrorCode(error, 'EPERM') || hasErrorCode(error, 'EROFS')
+  );
+}
+
+function isReadonlySqliteError(error: unknown): boolean {
+  const message =
+    error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return message.includes('readonly database');
+}
+
+async function openBunSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
+  const { Database } = await import('bun:sqlite');
+  const db = new (
+    Database as new (
+      path: string,
+      opts?: { create: boolean },
+    ) => {
+      exec(sql: string): void;
+      close(): void;
+      prepare(sql: string): {
+        run(...args: unknown[]): void;
+        get(...args: unknown[]): Record<string, unknown>;
+        all(...args: unknown[]): Record<string, unknown>[];
+        values(...args: unknown[]): unknown[][];
+      };
+      query(sql: string): {
+        run(...args: unknown[]): void;
+        get(...args: unknown[]): Record<string, unknown>;
+        all(...args: unknown[]): Record<string, unknown>[];
+      };
+    }
+  )(dbPath, { create: true });
+  db.exec('PRAGMA foreign_keys = ON');
+  db.exec('PRAGMA busy_timeout = 5000');
+
+  return {
+    exec(sql: string) {
+      return db.exec(sql);
+    },
+    close() {
+      db.close();
+    },
+    prepare(sql: string) {
+      const statement = typeof db.prepare === 'function' ? db.prepare(sql) : db.query(sql);
+      return {
+        run(...args: unknown[]) {
+          return statement.run(...args);
+        },
+        get(...args: unknown[]) {
+          return statement.get(...args);
+        },
+        all(...args: unknown[]) {
+          return statement.all(...args);
+        },
+      };
+    },
+  };
+}
+
+async function openNodeSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
+  const { DatabaseSync } = await import('node:sqlite');
+  const db = new DatabaseSync(dbPath, {
+    enableForeignKeyConstraints: true,
+    timeout: 5000,
+  });
+
+  return {
+    exec(sql: string) {
+      return db.exec(sql);
+    },
+    close() {
+      db.close();
+    },
+    prepare(sql: string) {
+      return db.prepare(sql) as SqlStatementLike;
+    },
+  };
+}
+
+async function openSqliteDatabase(dbPath: string): Promise<SqlDatabaseLike> {
+  const candidates = resolveSqliteRuntimeCandidates();
+  const openers: Record<SqliteRuntime, (path: string) => Promise<SqlDatabaseLike>> = {
+    bun: openBunSqliteDatabase,
+    node: openNodeSqliteDatabase,
+  };
+
+  let lastError: unknown;
+  for (const [index, runtime] of candidates.entries()) {
+    try {
+      return await openers[runtime](dbPath);
+    } catch (error) {
+      if (!isSqliteRuntimeImportError(runtime, error) || index === candidates.length - 1) {
+        throw error;
+      }
+
+      lastError = error;
+      logStartupPhase('open-db:sqlite-runtime-fallback', {
+        runtime,
+        fallbackRuntime: candidates[index + 1],
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('Unable to initialize a supported SQLite runtime.');
+}
+
+export class SqliteLcmStore {
+  private static readonly deferredPartUpdateDelayMs = 250;
+  private baseDir: string;
+  private dbPath: string;
+  private readonly privacy: CompiledPrivacyOptions;
+  private readonly workspaceDirectory: string;
+  private db?: SqlDatabaseLike;
+  private dbReadyPromise?: Promise<void>;
+  private deferredInitTimer?: ReturnType<typeof setTimeout>;
+  private deferredInitPromise?: Promise<void>;
+  private deferredInitRequested = false;
+  private activeOperationCount = 0;
+  private operationDrainWaiters: Array<() => void> = [];
+  private readonly pendingPartUpdates = new Map<string, Event>();
+  private readonly lastAutomaticRetrievalBySession = new Map<string, AutomaticRetrievalDebugInfo>();
+  private pendingPartUpdateTimer?: ReturnType<typeof setTimeout>;
+  private pendingPartUpdateFlushPromise?: Promise<void>;
+  private usingFallbackBaseDir = false;
+  private storeRecovered = false;
+  private lastRecovery?: { reason: string; at: number; quarantinedFiles: string[] };
+  private mutationTail: Promise<void> = Promise.resolve();
+  private closing = false;
+  private closePromise?: Promise<void>;
+  private static readonly compactFreeRatioThreshold = 0.2;
+
+  constructor(
+    projectDir: string,
+    private readonly options: OpencodeLcmOptions,
+  ) {
+    this.privacy = compilePrivacyOptions(options.privacy);
+    this.workspaceDirectory = projectDir;
+    this.baseDir = path.join(projectDir, options.storeDir ?? '.lcm');
+    this.dbPath = path.join(this.baseDir, 'lcm.db');
+  }
+
+  async init(): Promise<void> {
+    await this.ensureStoreDirReady();
+  }
+
+  private usesDefaultStoreDir(): boolean {
+    return this.options.storeDir === undefined || this.options.storeDir === '.lcm';
+  }
+
+  private resolveFallbackBaseDir(): string {
+    const worktreeKey = normalizeWorktreeKey(this.workspaceDirectory) ?? this.workspaceDirectory;
+    const suffix = createHash('sha256').update(worktreeKey).digest('hex').slice(0, 16);
+    return path.join(homedir(), '.opencode-lcm', 'stores', suffix);
+  }
+
+  private async probeStoreDirWrite(): Promise<void> {
+    const probePath = path.join(this.baseDir, `.write-probe-${process.pid}-${randomUUID()}`);
+    try {
+      await writeFile(probePath, '', { flag: 'wx' });
+    } finally {
+      try {
+        await unlink(probePath);
+      } catch {
+        // Best-effort cleanup; a stale probe file is less harmful than masking the real failure.
+      }
+    }
+  }
+
+  private async ensureStoreDirReady(): Promise<void> {
+    try {
+      await mkdir(this.baseDir, { recursive: true });
+      if (!this.usesDefaultStoreDir()) return;
+      await this.probeStoreDirWrite();
+    } catch (error) {
+      if (!(await this.trySwitchToFallbackBaseDir(error, 'init'))) throw error;
+      await mkdir(this.baseDir, { recursive: true });
+      await this.probeStoreDirWrite();
+    }
+  }
+
+  private async trySwitchToFallbackBaseDir(error: unknown, reason: string): Promise<boolean> {
+    if (this.usingFallbackBaseDir || !this.usesDefaultStoreDir()) return false;
+    if (!isFilesystemWriteError(error) && !isReadonlySqliteError(error)) return false;
+
+    const previousBaseDir = this.baseDir;
+    this.closeDbConnection();
+    this.baseDir = this.resolveFallbackBaseDir();
+    this.dbPath = path.join(this.baseDir, 'lcm.db');
+    this.usingFallbackBaseDir = true;
+    logStartupPhase('store-dir:fallback', {
+      reason,
+      from: previousBaseDir,
+      to: this.baseDir,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return true;
+  }
+
+  private closeDbConnection(): void {
+    if (this.deferredInitTimer) {
+      clearTimeout(this.deferredInitTimer);
+      this.deferredInitTimer = undefined;
+    }
+    if (this.db) this.db.close();
+    this.db = undefined;
+    this.dbReadyPromise = undefined;
+  }
+
+  private async withReadonlyStoreFallback<T>(
+    reason: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!(await this.trySwitchToFallbackBaseDir(error, reason))) throw error;
+      await this.ensureStoreDirReady();
+      return await operation();
+    }
+  }
+
+  // Keep deferred SQLite maintenance off the active connection while a store operation is running.
+  private async withStoreActivity<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.closing) throw new Error('opencode-lcm store is closing');
+    this.activeOperationCount += 1;
+    try {
+      return await operation();
+    } finally {
+      this.activeOperationCount -= 1;
+      if (this.activeOperationCount === 0 && this.deferredInitRequested) {
+        this.scheduleDeferredInit();
+      }
+      if (this.activeOperationCount === 0) {
+        const waiters = this.operationDrainWaiters;
+        this.operationDrainWaiters = [];
+        for (const resolve of waiters) resolve();
+      }
+    }
+  }
+
+  private waitForActiveOperations(): Promise<void> {
+    if (this.activeOperationCount === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => this.operationDrainWaiters.push(resolve));
+  }
+
+  private async withMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.mutationTail;
+    let release!: () => void;
+    this.mutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+
+  private async waitForDeferredInitIfRunning(): Promise<void> {
+    if (!this.deferredInitPromise) return;
+    await this.deferredInitPromise;
+  }
+
+  private async prepareForRead(): Promise<void> {
+    await this.ensureDbReady();
+    await this.waitForDeferredInitIfRunning();
+    await this.flushDeferredPartUpdates();
+  }
+
+  private scheduleDeferredPartUpdateFlush(): void {
+    if (this.pendingPartUpdateTimer || this.pendingPartUpdates.size === 0) return;
+
+    this.pendingPartUpdateTimer = setTimeout(() => {
+      this.pendingPartUpdateTimer = undefined;
+      void this.flushDeferredPartUpdates().catch((error) => {
+        logStartupPhase('deferred-part-flush:error', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }, SqliteLcmStore.deferredPartUpdateDelayMs);
+    unrefTimer(this.pendingPartUpdateTimer);
+  }
+
+  private clearDeferredPartUpdateTimer(): void {
+    if (!this.pendingPartUpdateTimer) return;
+    clearTimeout(this.pendingPartUpdateTimer);
+    this.pendingPartUpdateTimer = undefined;
+  }
+
+  private clearDeferredPartUpdatesForSession(sessionID?: string): void {
+    if (!sessionID || this.pendingPartUpdates.size === 0) return;
+
+    for (const [key, event] of this.pendingPartUpdates.entries()) {
+      if (event.type !== 'message.part.updated') continue;
+      if (event.properties.part.sessionID !== sessionID) continue;
+      this.pendingPartUpdates.delete(key);
+    }
+
+    if (this.pendingPartUpdates.size === 0) this.clearDeferredPartUpdateTimer();
+  }
+
+  private clearDeferredPartUpdatesForMessage(sessionID?: string, messageID?: string): void {
+    if (!sessionID || !messageID || this.pendingPartUpdates.size === 0) return;
+
+    for (const [key, event] of this.pendingPartUpdates.entries()) {
+      if (event.type !== 'message.part.updated') continue;
+      if (event.properties.part.sessionID !== sessionID) continue;
+      if (event.properties.part.messageID !== messageID) continue;
+      this.pendingPartUpdates.delete(key);
+    }
+
+    if (this.pendingPartUpdates.size === 0) this.clearDeferredPartUpdateTimer();
+  }
+
+  private clearDeferredPartUpdateForPart(
+    sessionID?: string,
+    messageID?: string,
+    partID?: string,
+  ): void {
+    if (!sessionID || !messageID || !partID || this.pendingPartUpdates.size === 0) return;
+    this.pendingPartUpdates.delete(`${sessionID}:${messageID}:${partID}`);
+    if (this.pendingPartUpdates.size === 0) this.clearDeferredPartUpdateTimer();
+  }
+
+  async captureDeferred(event: Event): Promise<void> {
+    return this.withStoreActivity(async () => {
+      switch (event.type) {
+        case 'message.part.updated': {
+          const key = getDeferredPartUpdateKey(event);
+          if (!key) return await this.capture(event);
+          this.pendingPartUpdates.set(key, event);
+          this.scheduleDeferredPartUpdateFlush();
+          return;
+        }
+        case 'message.part.removed':
+          this.clearDeferredPartUpdateForPart(
+            event.properties.sessionID,
+            event.properties.messageID,
+            event.properties.partID,
+          );
+          break;
+        case 'message.removed':
+          this.clearDeferredPartUpdatesForMessage(
+            event.properties.sessionID,
+            event.properties.messageID,
+          );
+          break;
+        case 'session.deleted':
+          this.clearDeferredPartUpdatesForSession(extractSessionID(event));
+          break;
+        default:
+          break;
+      }
+
+      await this.capture(event);
+    });
+  }
+
+  async flushDeferredPartUpdates(): Promise<void> {
+    return this.withStoreActivity(async () => {
+      if (this.pendingPartUpdateFlushPromise) return this.pendingPartUpdateFlushPromise;
+      if (this.pendingPartUpdates.size === 0) return;
+
+      this.clearDeferredPartUpdateTimer();
+      this.pendingPartUpdateFlushPromise = (async () => {
+        while (this.pendingPartUpdates.size > 0) {
+          const batch = [...this.pendingPartUpdates.values()];
+          this.pendingPartUpdates.clear();
+          for (const [index, event] of batch.entries()) {
+            try {
+              await this.capture(event);
+            } catch (error) {
+              for (const pendingEvent of batch.slice(index)) {
+                const key = getDeferredPartUpdateKey(pendingEvent);
+                if (key && !this.pendingPartUpdates.has(key)) {
+                  this.pendingPartUpdates.set(key, pendingEvent);
+                }
+              }
+              throw error;
+            }
+          }
+        }
+      })().finally(() => {
+        this.pendingPartUpdateFlushPromise = undefined;
+        if (this.pendingPartUpdates.size > 0) this.scheduleDeferredPartUpdateFlush();
+      });
+
+      return this.pendingPartUpdateFlushPromise;
+    });
+  }
+
+  private async ensureDbReady(): Promise<void> {
+    await this.withReadonlyStoreFallback('open-db', async () => {
+      if (!this.dbReadyPromise) {
+        if (this.db) {
+          this.scheduleDeferredInit();
+          return;
+        }
+        this.dbReadyPromise = this.openAndInitializeDb();
+      }
+
+      await this.dbReadyPromise;
+      this.scheduleDeferredInit();
+    });
+  }
+
+  private async openAndInitializeDb(): Promise<void> {
+    logStartupPhase('open-db:start', { dbPath: this.dbPath });
+    await mkdir(this.baseDir, { recursive: true });
+    await this.loadRecoveryRecord();
+    logStartupPhase('open-db:connect', {
+      runtime: typeof globalThis === 'object' && 'Bun' in globalThis ? 'bun' : 'node',
+      sqliteRuntime: resolveSqliteRuntime(),
+    });
+    await this.openAndInitializeConnection();
+  }
+
+  private async openAndInitializeConnection(): Promise<void> {
+    let db: SqlDatabaseLike;
+    try {
+      db = await openSqliteDatabase(this.dbPath);
+    } catch (error) {
+      if (this.isCorruptionError(error) && !this.storeRecovered) {
+        await this.quarantineCorruptedStore(error);
+        this.storeRecovered = true;
+        await this.openAndInitializeConnection();
+        return;
+      }
+      throw error;
+    }
+
+    this.db = db;
+
+    try {
+      logStartupPhase('open-db:schema-check');
+      this.assertSupportedSchemaVersionSync();
+      db.exec('PRAGMA journal_mode = WAL');
+      db.exec('PRAGMA synchronous = NORMAL');
+      logStartupPhase('open-db:create-tables');
+      db.exec(`
+      CREATE TABLE IF NOT EXISTS events (
+        id TEXT PRIMARY KEY,
+        session_id TEXT,
+        event_type TEXT NOT NULL,
+        ts INTEGER NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_events_session_ts ON events(session_id, ts);
+
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        title TEXT,
+        session_directory TEXT,
+        worktree_key TEXT,
+        parent_session_id TEXT,
+        root_session_id TEXT,
+        lineage_depth INTEGER,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        pin_reason TEXT,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        compacted_at INTEGER,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        event_count INTEGER NOT NULL DEFAULT 0
+      );
+
+      CREATE TABLE IF NOT EXISTS messages (
+        message_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        info_json TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_messages_session_created ON messages(session_id, created_at, message_id);
+
+      CREATE TABLE IF NOT EXISTS parts (
+        part_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        sort_key INTEGER NOT NULL DEFAULT 0,
+        part_json TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+        FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_parts_message_sort ON parts(message_id, sort_key, part_id);
+
+      CREATE TABLE IF NOT EXISTS resumes (
+        session_id TEXT PRIMARY KEY,
+        note TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        part_id TEXT NOT NULL,
+        artifact_kind TEXT NOT NULL,
+        field_name TEXT NOT NULL,
+        preview_text TEXT NOT NULL,
+        content_text TEXT NOT NULL,
+        content_hash TEXT,
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        char_count INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+        FOREIGN KEY (message_id) REFERENCES messages(message_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_artifacts_session_message ON artifacts(session_id, message_id, part_id);
+
+      CREATE TABLE IF NOT EXISTS artifact_blobs (
+        content_hash TEXT PRIMARY KEY,
+        content_text TEXT NOT NULL,
+        char_count INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        orphaned_at INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS summary_nodes (
+        node_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        level INTEGER NOT NULL,
+        node_kind TEXT NOT NULL,
+        start_index INTEGER NOT NULL,
+        end_index INTEGER NOT NULL,
+        message_ids_json TEXT NOT NULL,
+        summary_text TEXT NOT NULL,
+        strategy TEXT NOT NULL DEFAULT 'deterministic-v1',
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_summary_nodes_session_level ON summary_nodes(session_id, level);
+
+      CREATE TABLE IF NOT EXISTS summary_edges (
+        session_id TEXT NOT NULL,
+        parent_id TEXT NOT NULL,
+        child_id TEXT NOT NULL,
+        child_position INTEGER NOT NULL,
+        PRIMARY KEY (parent_id, child_id),
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE,
+        FOREIGN KEY (parent_id) REFERENCES summary_nodes(node_id) ON DELETE CASCADE,
+        FOREIGN KEY (child_id) REFERENCES summary_nodes(node_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_summary_edges_session_parent ON summary_edges(session_id, parent_id, child_position);
+
+      CREATE TABLE IF NOT EXISTS summary_state (
+        session_id TEXT PRIMARY KEY,
+        archived_count INTEGER NOT NULL,
+        latest_message_created INTEGER NOT NULL,
+        archived_signature TEXT NOT NULL DEFAULT '',
+        root_node_ids_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
+      );
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+        session_id UNINDEXED,
+        message_id UNINDEXED,
+        role UNINDEXED,
+        created_at UNINDEXED,
+        content
+      );
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS summary_fts USING fts5(
+        session_id UNINDEXED,
+        node_id UNINDEXED,
+        level UNINDEXED,
+        created_at UNINDEXED,
+        content
+      );
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS artifact_fts USING fts5(
+        session_id UNINDEXED,
+        artifact_id UNINDEXED,
+        message_id UNINDEXED,
+        part_id UNINDEXED,
+        artifact_kind UNINDEXED,
+        created_at UNINDEXED,
+        content
+      );
+    `);
+
+      this.ensureSessionColumnsSync();
+      this.ensureSummaryStateColumnsSync();
+      this.ensureSummaryNodeColumnsSync();
+      this.ensureArtifactColumnsSync();
+      logStartupPhase('open-db:create-indexes');
+      db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_content_hash ON artifacts(content_hash)');
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_session_id, updated_at DESC)',
+      );
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id, updated_at DESC)',
+      );
+      db.exec(
+        'CREATE INDEX IF NOT EXISTS idx_sessions_worktree ON sessions(worktree_key, updated_at DESC)',
+      );
+      logStartupPhase('open-db:migrate-legacy-artifacts');
+      await this.migrateLegacyArtifacts();
+      const schemaVersion = this.readSchemaVersionSync();
+      if (schemaVersion !== STORE_SCHEMA_VERSION) {
+        logStartupPhase('open-db:write-schema-version', { schemaVersion: STORE_SCHEMA_VERSION });
+        this.writeSchemaVersionSync(STORE_SCHEMA_VERSION);
+      }
+      logStartupPhase('open-db:ready');
+    } catch (error) {
+      logStartupPhase('open-db:error', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      try {
+        db.close();
+      } catch {
+        // Ignore close failures during error recovery.
+      }
+      this.db = undefined;
+      this.dbReadyPromise = undefined;
+      if (this.isCorruptionError(error) && !this.storeRecovered) {
+        await this.quarantineCorruptedStore(error);
+        this.storeRecovered = true;
+        await this.openAndInitializeConnection();
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private isCorruptionError(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error ?? '');
+    const code = (error as { code?: unknown } | null)?.code;
+    return (
+      /database disk image is malformed|file is not a database|not a database|SQLITE_CORRUPT|SQLITE_NOTADB|corrupt/i.test(
+        message,
+      ) ||
+      code === 'SQLITE_CORRUPT' ||
+      code === 'SQLITE_NOTADB'
+    );
+  }
+
+  private async quarantineCorruptedStore(error: unknown): Promise<void> {
+    const reason = error instanceof Error ? error.message : String(error ?? 'unknown corruption');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const dbName = path.basename(this.dbPath);
+    const quarantineDir = path.join(this.baseDir, `${dbName}.corrupted-${stamp}`);
+    const suffixes = ['', '-wal', '-shm', '-journal'];
+    const sourceFiles: Array<{ source: string; destination: string }> = [];
+    const quarantinedFiles: string[] = [];
+
+    for (const suffix of suffixes) {
+      const source = `${this.dbPath}${suffix}`;
+      try {
+        const info = await stat(source);
+        if (!info.isFile()) continue;
+      } catch {
+        continue;
+      }
+      sourceFiles.push({ source, destination: path.join(quarantineDir, `${dbName}${suffix}`) });
+    }
+
+    if (sourceFiles.length === 0)
+      throw new Error(`Corrupt SQLite store was not found: ${this.dbPath}`);
+
+    await mkdir(quarantineDir, { recursive: false });
+    try {
+      for (const file of sourceFiles) {
+        await rename(file.source, file.destination);
+        quarantinedFiles.push(file.destination);
+      }
+    } catch (quarantineError) {
+      for (const file of [...sourceFiles].reverse()) {
+        if (!quarantinedFiles.includes(file.destination)) continue;
+        try {
+          await rename(file.destination, file.source);
+        } catch {
+          // Keep trying to restore the remaining files before surfacing the failure.
+        }
+      }
+      throw new Error(
+        `Unable to quarantine corrupt SQLite store: ${quarantineError instanceof Error ? quarantineError.message : String(quarantineError)}`,
+      );
+    }
+
+    this.lastRecovery = { reason, at: Date.now(), quarantinedFiles };
+    await this.persistRecoveryRecord();
+    logStartupPhase('open-db:quarantined-corrupt', {
+      reason,
+      files: quarantinedFiles,
+      baseDir: this.baseDir,
+    });
+  }
+
+  private async loadRecoveryRecord(): Promise<void> {
+    if (this.lastRecovery) return;
+    try {
+      const record = JSON.parse(
+        await readFile(path.join(this.baseDir, 'last-recovery.json'), 'utf8'),
+      ) as { reason?: unknown; at?: unknown; quarantinedFiles?: unknown };
+      if (
+        typeof record.reason === 'string' &&
+        typeof record.at === 'number' &&
+        Array.isArray(record.quarantinedFiles) &&
+        record.quarantinedFiles.every((entry) => typeof entry === 'string')
+      ) {
+        this.lastRecovery = {
+          reason: record.reason,
+          at: record.at,
+          quarantinedFiles: record.quarantinedFiles,
+        };
+      }
+    } catch {
+      // No prior recovery record, or the record is unreadable.
+    }
+  }
+
+  private async persistRecoveryRecord(): Promise<void> {
+    if (!this.lastRecovery) return;
+    const recordPath = path.join(this.baseDir, 'last-recovery.json');
+    const temporaryPath = `${recordPath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporaryPath, `${JSON.stringify(this.lastRecovery, null, 2)}\n`, 'utf8');
+    await rename(temporaryPath, recordPath);
+  }
+
+  private deferredInitCompleted = false;
+
+  private runDeferredInit(): Promise<void> {
+    if (this.deferredInitCompleted) return Promise.resolve();
+    if (this.deferredInitPromise) return this.deferredInitPromise;
+
+    this.deferredInitPromise = this.withStoreActivity(async () => {
+      this.deferredInitRequested = false;
+      logStartupPhase('deferred-init:start');
+      this.completeDeferredInit();
+    })
+      .catch((error) => {
+        getLogger().warn('Deferred LCM maintenance failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      })
+      .finally(() => {
+        this.deferredInitPromise = undefined;
+      });
+
+    return this.deferredInitPromise;
+  }
+
+  private scheduleDeferredInit(): void {
+    if (!this.db || this.deferredInitCompleted || this.deferredInitPromise) {
+      return;
+    }
+
+    this.deferredInitRequested = true;
+    if (this.activeOperationCount > 0 || this.deferredInitTimer) return;
+
+    logStartupPhase('deferred-init:scheduled');
+    this.deferredInitTimer = setTimeout(() => {
+      this.deferredInitTimer = undefined;
+      if (this.activeOperationCount > 0) {
+        this.scheduleDeferredInit();
+        return;
+      }
+      void this.runDeferredInit();
+    }, 0);
+    unrefTimer(this.deferredInitTimer);
+  }
+
+  private async ensureDeferredInitComplete(): Promise<void> {
+    await this.ensureDbReady();
+    if (this.deferredInitCompleted) return;
+
+    if (this.deferredInitTimer) {
+      clearTimeout(this.deferredInitTimer);
+      this.deferredInitTimer = undefined;
+    }
+
+    await this.runDeferredInit();
+  }
+
+  private readSchemaVersionSync(): number {
+    return firstFiniteNumber(this.getDb().prepare('PRAGMA user_version').get()) ?? 0;
+  }
+
+  private assertSupportedSchemaVersionSync(): void {
+    const schemaVersion = this.readSchemaVersionSync();
+    if (schemaVersion <= STORE_SCHEMA_VERSION) return;
+    throw new Error(
+      `Unsupported store schema version: ${schemaVersion}. This build supports up to ${STORE_SCHEMA_VERSION}.`,
+    );
+  }
+
+  private writeSchemaVersionSync(version: number): void {
+    this.getDb().exec(`PRAGMA user_version = ${Math.max(0, Math.trunc(version))}`);
+  }
+
+  private completeDeferredInit(): void {
+    if (this.deferredInitCompleted) return;
+    if (this.hasPendingArtifactBlobBackfillSync()) {
+      logStartupPhase('deferred-init:artifact-backfill');
+      this.backfillArtifactBlobsSync();
+    }
+    logStartupPhase('deferred-init:orphan-blob-cleanup');
+    this.deleteOrphanArtifactBlobsSync(this.orphanBlobGracePeriodMs());
+    if (
+      this.options.retention.staleSessionDays !== undefined ||
+      this.options.retention.deletedSessionDays !== undefined ||
+      this.options.retention.orphanBlobDays !== undefined
+    ) {
+      logStartupPhase('deferred-init:retention-prune');
+      this.applyRetentionPruneSync({ apply: true });
+    }
+    if (this.hasPendingLineageRefreshSync()) {
+      logStartupPhase('deferred-init:lineage-refresh');
+      this.refreshAllLineageSync();
+    }
+    logStartupPhase('deferred-init:done');
+    this.deferredInitCompleted = true;
+  }
+
+  private hasPendingArtifactBlobBackfillSync(): boolean {
+    const row = this.getDb()
+      .prepare(
+        "SELECT COUNT(*) AS count FROM artifacts WHERE content_hash IS NULL OR content_text != ''",
+      )
+      .get() as { count: number };
+    return row.count > 0;
+  }
+
+  private hasPendingLineageRefreshSync(): boolean {
+    const row = this.getDb()
+      .prepare(
+        'SELECT COUNT(*) AS count FROM sessions WHERE root_session_id IS NULL OR lineage_depth IS NULL',
+      )
+      .get() as { count: number };
+    return row.count > 0;
+  }
+
+  close(): Promise<void> {
+    if (this.closePromise) return this.closePromise;
+    this.closePromise = this.closeStore().catch((error) => {
+      this.closePromise = undefined;
+      this.closing = false;
+      throw error;
+    });
+    return this.closePromise;
+  }
+
+  private async closeStore(): Promise<void> {
+    this.clearDeferredPartUpdateTimer();
+    if (this.pendingPartUpdateFlushPromise) await this.pendingPartUpdateFlushPromise;
+    if (this.pendingPartUpdates.size > 0) await this.flushDeferredPartUpdates();
+
+    this.closing = true;
+    if (this.deferredInitTimer) {
+      clearTimeout(this.deferredInitTimer);
+      this.deferredInitTimer = undefined;
+    }
+    await this.mutationTail;
+    await this.waitForActiveOperations();
+
+    this.pendingPartUpdates.clear();
+    this.lastAutomaticRetrievalBySession.clear();
+    this.closeDbConnection();
+  }
+
+  async capture(event: Event): Promise<void> {
+    return this.withStoreActivity(() =>
+      this.withMutation(async () => {
+        await this.withReadonlyStoreFallback('capture', async () => {
+          const normalized = normalizeEvent(event);
+          if (!normalized) return;
+
+          if (this.shouldSkipMalformedCapturedEvent(normalized)) return;
+
+          const shouldRecord = this.shouldRecordEvent(normalized.type);
+          const shouldPersistSession =
+            Boolean(normalized.sessionID) && this.shouldPersistSessionForEvent(normalized.type);
+          if (!shouldRecord && !shouldPersistSession) return;
+
+          await this.ensureDeferredInitComplete();
+
+          if (!normalized.sessionID || !shouldPersistSession) {
+            if (shouldRecord) this.writeEvent(normalized);
+            return;
+          }
+
+          const session = shouldUseLightweightPartCapture(normalized)
+            ? this.readSessionForCaptureSync(normalized, { hydrateArtifacts: false })
+            : resolveCaptureHydrationMode() === 'targeted'
+              ? this.readSessionForCaptureSync(normalized)
+              : this.readSessionSync(normalized.sessionID);
+          const previousParentSessionID = session.parentSessionID;
+          const shouldSyncDerivedState = this.shouldSyncDerivedSessionStateForEvent(
+            session,
+            normalized,
+          );
+          let next = this.applyEvent(session, normalized);
+          next.updatedAt = Math.max(next.updatedAt, normalized.timestamp);
+          next.eventCount += 1;
+          next = this.prepareSessionForPersistence(next);
+
+          await this.persistCapturedSession(next, normalized, shouldRecord);
+
+          if (this.shouldRefreshLineageForEvent(normalized.type)) {
+            this.refreshAllLineageSync();
+            const refreshed = this.readSessionHeaderSync(normalized.sessionID);
+            if (refreshed) {
+              next = {
+                ...next,
+                parentSessionID: refreshed.parentSessionID,
+                rootSessionID: refreshed.rootSessionID,
+                lineageDepth: refreshed.lineageDepth,
+              };
+            }
+          }
+
+          if (shouldSyncDerivedState) {
+            this.syncDerivedSessionStateSync(this.readSessionSync(normalized.sessionID));
+          }
+
+          if (
+            this.shouldSyncDerivedLineageSubtree(
+              normalized.type,
+              previousParentSessionID,
+              next.parentSessionID,
+            )
+          ) {
+            this.syncDerivedLineageSubtreeSync(normalized.sessionID, true);
+          }
+
+          if (this.shouldCleanupOrphanBlobsForEvent(normalized.type)) {
+            this.deleteOrphanArtifactBlobsSync(this.orphanBlobGracePeriodMs());
+          }
+        });
+      }),
+    );
+  }
+
+  async stats(): Promise<StoreStats> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      await this.ensureDeferredInitComplete();
+      const db = this.getDb();
+      const fileSizes = await this.readStoreFileSizes();
+      const prunableEventTypes = this.readPrunableEventTypeCountsSync();
+      const totalRow = validateRow<{ count: number; latest: number | null }>(
+        db.prepare('SELECT COUNT(*) AS count, MAX(ts) AS latest FROM events').get(),
+        { count: 'number', latest: 'nullable' },
+        'stats.totalEvents',
+      );
+      const sessionRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM sessions').get(),
+        { count: 'number' },
+        'stats.sessionCount',
+      );
+      const typeRows = safeQuery<{ event_type: string; count: number }>(
+        db.prepare(
+          'SELECT event_type, COUNT(*) AS count FROM events GROUP BY event_type ORDER BY count DESC',
+        ),
+        [],
+        'stats.eventTypes',
+      );
+      const summaryNodeRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM summary_nodes').get(),
+        { count: 'number' },
+        'stats.summaryNodeCount',
+      );
+      const summaryStateRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM summary_state').get(),
+        { count: 'number' },
+        'stats.summaryStateCount',
+      );
+      const artifactRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM artifacts').get(),
+        { count: 'number' },
+        'stats.artifactCount',
+      );
+      const blobRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM artifact_blobs').get(),
+        { count: 'number' },
+        'stats.artifactBlobCount',
+      );
+      const sharedBlobRow = validateRow<{ count: number }>(
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM (
+           SELECT content_hash FROM artifacts
+           WHERE content_hash IS NOT NULL
+           GROUP BY content_hash
+           HAVING COUNT(*) > 1
+         )`,
+          )
+          .get(),
+        { count: 'number' },
+        'stats.sharedArtifactBlobCount',
+      );
+      const orphanBlobRow = validateRow<{ count: number }>(
+        db
+          .prepare(
+            `SELECT COUNT(*) AS count FROM artifact_blobs b
+         WHERE NOT EXISTS (
+           SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+         )`,
+          )
+          .get(),
+        { count: 'number' },
+        'stats.orphanArtifactBlobCount',
+      );
+      const rootRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NULL').get(),
+        { count: 'number' },
+        'stats.rootSessionCount',
+      );
+      const branchedRow = validateRow<{ count: number }>(
+        db
+          .prepare('SELECT COUNT(*) AS count FROM sessions WHERE parent_session_id IS NOT NULL')
+          .get(),
+        { count: 'number' },
+        'stats.branchedSessionCount',
+      );
+      const pinnedRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM sessions WHERE pinned = 1').get(),
+        { count: 'number' },
+        'stats.pinnedSessionCount',
+      );
+      const worktreeRow = validateRow<{ count: number }>(
+        db
+          .prepare(
+            'SELECT COUNT(DISTINCT worktree_key) AS count FROM sessions WHERE worktree_key IS NOT NULL',
+          )
+          .get(),
+        { count: 'number' },
+        'stats.worktreeCount',
+      );
+      const messageFtsRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM message_fts').get(),
+        { count: 'number' },
+        'stats.messageFtsCount',
+      );
+      const summaryFtsRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM summary_fts').get(),
+        { count: 'number' },
+        'stats.summaryFtsCount',
+      );
+      const artifactFtsRow = validateRow<{ count: number }>(
+        db.prepare('SELECT COUNT(*) AS count FROM artifact_fts').get(),
+        { count: 'number' },
+        'stats.artifactFtsCount',
+      );
+
+      return {
+        schemaVersion: readSchemaVersionSync(db),
+        totalEvents: totalRow.count,
+        sessionCount: sessionRow.count,
+        latestEventAt: totalRow.latest ?? undefined,
+        eventTypes: Object.fromEntries(typeRows.map((row) => [row.event_type, row.count])),
+        summaryNodeCount: summaryNodeRow.count,
+        summaryStateCount: summaryStateRow.count,
+        rootSessionCount: rootRow.count,
+        branchedSessionCount: branchedRow.count,
+        artifactCount: artifactRow.count,
+        artifactBlobCount: blobRow.count,
+        sharedArtifactBlobCount: sharedBlobRow.count,
+        orphanArtifactBlobCount: orphanBlobRow.count,
+        worktreeCount: worktreeRow.count,
+        pinnedSessionCount: pinnedRow.count,
+        dbBytes: fileSizes.dbBytes,
+        walBytes: fileSizes.walBytes,
+        shmBytes: fileSizes.shmBytes,
+        totalBytes: fileSizes.totalBytes,
+        prunableEventCount: prunableEventTypes.reduce((sum, row) => sum + row.count, 0),
+        prunableEventTypes: Object.fromEntries(
+          prunableEventTypes.map((row) => [row.eventType, row.count]),
+        ),
+        messageFtsCount: messageFtsRow.count,
+        summaryFtsCount: summaryFtsRow.count,
+        artifactFtsCount: artifactFtsRow.count,
+        recovery: this.lastRecovery,
+      };
+    });
+  }
+
+  async automaticRetrievalDebug(sessionID?: string): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
+      if (!resolvedSessionID) return 'No archived sessions yet.';
+
+      const debug = this.lastAutomaticRetrievalBySession.get(resolvedSessionID);
+      if (!debug) {
+        return [
+          `session_id=${resolvedSessionID}`,
+          'status=no-debug-data',
+          'Run another turn in this session so transformMessages can record recall telemetry.',
+        ].join('\n');
+      }
+
+      const lines = [
+        `session_id=${debug.sessionID}`,
+        `status=${debug.status}`,
+        `anchor_message_id=${debug.anchorMessageID ?? 'n/a'}`,
+        `anchor_role=${debug.anchorRole ?? 'n/a'}`,
+        `archived_messages=${debug.archivedCount ?? 0}`,
+        `recent_messages=${debug.recentCount ?? 0}`,
+        `allowed_hits=${debug.allowedHits}`,
+        `target_hits=${debug.targetHits}`,
+        `raw_results=${debug.rawResultCount}`,
+        `selected_hits=${debug.hitCount}`,
+        `stop_reason=${debug.stopReason}`,
+        `query_tokens=${debug.queryTokens.length > 0 ? debug.queryTokens.join(',') : 'none'}`,
+        `queries=${debug.queries.length > 0 ? debug.queries.join(' | ') : 'none'}`,
+        `searched_scopes=${debug.searchedScopes.length > 0 ? debug.searchedScopes.join(',') : 'none'}`,
+        'scope_stats:',
+        ...(debug.scopeStats.length > 0
+          ? debug.scopeStats.map(
+              (entry) =>
+                `- ${entry.scope} budget=${entry.budget} raw_results=${entry.rawResults} selected_hits=${entry.selectedHits}`,
+            )
+          : ['- none']),
+        'selected_hit_preview:',
+        ...(debug.hits.length > 0
+          ? debug.hits.map(
+              (hit) =>
+                `- ${hit.kind} session=${hit.sessionID ?? 'n/a'} id=${hit.id} label=${hit.label} snippet=${truncate(hit.snippet, 160)}`,
+            )
+          : ['- none']),
+      ];
+
+      return lines.join('\n');
+    });
+  }
+
+  async grep(input: {
+    query: string;
+    sessionID?: string;
+    scope?: string;
+    limit?: number;
+  }): Promise<SearchResult[]> {
+    return this.withStoreActivity(async () => {
+      const resolvedScope = this.resolveConfiguredScope('grep', input.scope, input.sessionID);
+      const limit = input.limit ?? 5;
+      const needle = input.query.trim();
+      if (!needle) return [];
+
+      await this.prepareForRead();
+      const sessionIDs = this.resolveScopeSessionIDs(resolvedScope, input.sessionID);
+
+      const ftsResults = this.searchWithFts(needle, sessionIDs, limit);
+      if (ftsResults.length > 0) return ftsResults;
+      return this.searchByScan(needle.toLowerCase(), sessionIDs, limit);
+    });
+  }
+
+  async describe(input?: { sessionID?: string; scope?: string }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const scope = this.resolveConfiguredScope('describe', input?.scope, input?.sessionID);
+        const sessionID = input?.sessionID;
+
+        if (scope !== 'session') {
+          const scopedSessions = this.readScopedSessionsSync(
+            this.resolveScopeSessionIDs(scope, sessionID),
+          );
+          if (scopedSessions.length === 0) return 'No archived sessions yet.';
+
+          return [
+            `Scope: ${scope}`,
+            `Sessions: ${scopedSessions.length}`,
+            `Latest update: ${Math.max(...scopedSessions.map((session) => session.updatedAt))}`,
+            `Root sessions: ${new Set(scopedSessions.map((session) => session.rootSessionID ?? session.sessionID)).size}`,
+            `Worktrees: ${new Set(scopedSessions.map((session) => normalizeWorktreeKey(session.directory)).filter(Boolean)).size}`,
+            'Matching sessions:',
+            ...scopedSessions
+              .sort((a, b) => b.updatedAt - a.updatedAt)
+              .slice(0, 8)
+              .map((session) => {
+                const root = session.rootSessionID ?? session.sessionID;
+                const worktree = normalizeWorktreeKey(session.directory) ?? 'unknown';
+                return `- ${session.sessionID}: ${makeSessionTitle(session) ?? 'Untitled session'} (root=${root}, worktree=${worktree})`;
+              }),
+          ].join('\n');
+        }
+
+        if (!sessionID) {
+          const sessions = this.readAllSessionsSync();
+          if (sessions.length === 0) return 'No archived sessions yet.';
+
+          return [
+            `Archived sessions: ${sessions.length}`,
+            `Latest update: ${Math.max(...sessions.map((session) => session.updatedAt))}`,
+            `Root sessions: ${sessions.filter((session) => !session.parentSessionID).length}`,
+            `Branched sessions: ${sessions.filter((session) => Boolean(session.parentSessionID)).length}`,
+            'Recent sessions:',
+            ...sessions
+              .sort((a, b) => b.updatedAt - a.updatedAt)
+              .slice(0, 5)
+              .map(
+                (session) =>
+                  `- ${session.sessionID}: ${makeSessionTitle(session) ?? 'Untitled session'}`,
+              ),
+          ].join('\n');
+        }
+
+        const session = this.readSessionSync(sessionID);
+        if (session.messages.length === 0) return 'No archived events yet.';
+
+        const roots = this.getSummaryRootsForSession(session);
+        const userMessages = session.messages.filter((message) => message.info.role === 'user');
+        const assistantMessages = session.messages.filter(
+          (message) => message.info.role === 'assistant',
+        );
+        const files = new Set(session.messages.flatMap(listFiles));
+        const recent = session.messages.slice(-5).map((message) => {
+          const snippet =
+            guessMessageText(message, this.options.interop.ignoreToolPrefixes) ||
+            '(no text content)';
+          return `- ${message.info.role} ${message.info.id}: ${snippet}`;
+        });
+
+        return [
+          `Session: ${session.sessionID}`,
+          `Title: ${makeSessionTitle(session) ?? 'Unknown'}`,
+          `Directory: ${session.directory ?? 'unknown'}`,
+          `Parent session: ${session.parentSessionID ?? 'none'}`,
+          `Root session: ${session.rootSessionID ?? session.sessionID}`,
+          `Lineage depth: ${session.lineageDepth ?? 0}`,
+          `Pinned: ${session.pinned ? `yes${session.pinReason ? ` (${session.pinReason})` : ''}` : 'no'}`,
+          `Messages: ${session.messages.length}`,
+          `User messages: ${userMessages.length}`,
+          `Assistant messages: ${assistantMessages.length}`,
+          `Tracked files: ${files.size}`,
+          `Summary roots: ${roots.length}`,
+          `Child branches: ${this.readChildSessionsSync(session.sessionID).length}`,
+          `Last updated: ${session.updatedAt}`,
+          ...(roots.length > 0
+            ? [
+                'Summary root previews:',
+                ...roots
+                  .slice(0, 4)
+                  .map((node) => `- ${shortNodeID(node.nodeID)}: ${node.summaryText}`),
+              ]
+            : []),
+          'Recent entries:',
+          ...recent,
+        ].join('\n');
+      });
+    });
+  }
+
+  async doctor(input?: { sessionID?: string; apply?: boolean; limit?: number }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const sessionID = input?.sessionID;
+        const apply = input?.apply ?? false;
+
+        const before = this.collectDoctorReport(sessionID);
+        if (!apply || !this.hasDoctorIssues(before)) {
+          return formatDoctorReport(before, limit);
+        }
+
+        const checkedSessions = sessionID
+          ? [sessionID]
+          : this.readAllSessionsSync().map((session) => session.sessionID);
+        const appliedActions: string[] = [];
+
+        this.ensureSessionColumnsSync();
+        this.ensureSummaryStateColumnsSync();
+        this.ensureArtifactColumnsSync();
+        appliedActions.push('ensured schema columns');
+
+        if (before.summarySessionsNeedingRebuild.length > 0 || before.orphanSummaryEdges > 0) {
+          this.rebuildSummarySessionsSync(checkedSessions);
+          appliedActions.push(
+            `rebuilt summary DAGs for ${checkedSessions.length} checked session(s)`,
+          );
+        }
+
+        if (before.lineageSessionsNeedingRefresh.length > 0) {
+          this.refreshAllLineageSync();
+          this.syncAllDerivedSessionStateSync(true);
+          appliedActions.push('refreshed lineage metadata');
+        }
+
+        if (before.orphanArtifactBlobs > 0) {
+          this.backfillArtifactBlobsSync();
+          const deleted = this.deleteOrphanArtifactBlobsSync(this.orphanBlobGracePeriodMs());
+          if (deleted.length > 0) {
+            appliedActions.push(`deleted ${deleted.length} orphan artifact blob(s)`);
+          }
+        }
+
+        if (
+          before.messageFts.expected !== before.messageFts.actual ||
+          before.summaryFts.expected !== before.summaryFts.actual ||
+          before.artifactFts.expected !== before.artifactFts.actual ||
+          before.summarySessionsNeedingRebuild.length > 0 ||
+          before.orphanSummaryEdges > 0
+        ) {
+          this.refreshSearchIndexesSync(checkedSessions);
+          appliedActions.push('rebuilt FTS indexes');
+        }
+
+        const after = this.collectDoctorReport(sessionID);
+        after.status = this.hasDoctorIssues(after) ? 'issues-found' : 'repaired';
+        after.appliedActions = appliedActions;
+        return formatDoctorReport(after, limit);
+      });
+    });
+  }
+
+  private collectDoctorReport(sessionID?: string): DoctorReport {
+    const sessions = sessionID ? [this.readSessionSync(sessionID)] : this.readAllSessionsSync();
+    const sessionIDs = sessions.map((session) => session.sessionID);
+    const summarySessionsNeedingRebuild = sessions
+      .map((session) => this.diagnoseSummarySession(session))
+      .filter((issue): issue is DoctorSessionIssue => Boolean(issue));
+    const lineageSessionsNeedingRefresh = sessions
+      .filter((session) => this.needsLineageRefresh(session))
+      .map((session) => session.sessionID);
+
+    const messageFtsExpected = sessions.reduce((count, session) => {
+      return (
+        count +
+        session.messages.filter(
+          (message) =>
+            guessMessageText(message, this.options.interop.ignoreToolPrefixes).length > 0,
+        ).length
+      );
+    }, 0);
+
+    const report: DoctorReport = {
+      scope: sessionID ? `session:${sessionID}` : 'all',
+      checkedSessions: sessions.length,
+      summarySessionsNeedingRebuild,
+      lineageSessionsNeedingRefresh,
+      orphanSummaryEdges: this.countScopedOrphanSummaryEdges(sessionIDs),
+      messageFts: {
+        expected: messageFtsExpected,
+        actual: this.countScopedFtsRows('message_fts', sessionIDs),
+      },
+      summaryFts: {
+        expected: this.readScopedSummaryRowsSync(sessionIDs).length,
+        actual: this.countScopedFtsRows('summary_fts', sessionIDs),
+      },
+      artifactFts: {
+        expected: this.readScopedArtifactRowsSync(sessionIDs).length,
+        actual: this.countScopedFtsRows('artifact_fts', sessionIDs),
+      },
+      orphanArtifactBlobs: this.selectOrphanBlobsForDeletionSync(this.orphanBlobGracePeriodMs())
+        .length,
+      integrityCheck: this.runIntegrityCheckSync(),
+      foreignKeyViolations: this.countForeignKeyViolationsSync(),
+      malformedEventRows: this.countMalformedEventRowsSync(),
+      status: 'clean',
+    };
+
+    report.status = this.hasDoctorIssues(report) ? 'issues-found' : 'clean';
+    return report;
+  }
+
+  private hasDoctorIssues(report: DoctorReport): boolean {
+    return (
+      report.summarySessionsNeedingRebuild.length > 0 ||
+      report.lineageSessionsNeedingRefresh.length > 0 ||
+      report.orphanSummaryEdges > 0 ||
+      report.messageFts.expected !== report.messageFts.actual ||
+      report.summaryFts.expected !== report.summaryFts.actual ||
+      report.artifactFts.expected !== report.artifactFts.actual ||
+      report.orphanArtifactBlobs > 0 ||
+      report.integrityCheck.status !== 'ok' ||
+      report.foreignKeyViolations > 0 ||
+      report.malformedEventRows > 0
+    );
+  }
+
+  private runIntegrityCheckSync(): { status: 'ok' | 'error'; message: string } {
+    try {
+      const rows = this.getDb().prepare('PRAGMA integrity_check').all() as Array<{
+        integrity_check?: string;
+      }>;
+      const texts = rows.map((row) => row.integrity_check ?? '');
+      if (texts.length === 1 && texts[0] === 'ok') {
+        return { status: 'ok', message: 'ok' };
+      }
+      return {
+        status: 'error',
+        message: texts.slice(0, 20).join('; ') || 'integrity_check reported problems',
+      };
+    } catch (error) {
+      return {
+        status: 'error',
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  private countForeignKeyViolationsSync(): number {
+    const rows = this.getDb().prepare('PRAGMA foreign_key_check').all() as unknown[];
+    return rows.length;
+  }
+
+  private countMalformedEventRowsSync(): number {
+    const rows = this.getDb()
+      .prepare('SELECT event_type, payload_json FROM events')
+      .all() as Array<{
+      event_type: string;
+      payload_json: string;
+    }>;
+    let malformed = 0;
+    for (const row of rows) {
+      const expectedStub =
+        row.event_type.startsWith('message.') || row.event_type.startsWith('session.')
+          ? `[${row.event_type}]`
+          : '';
+      if (row.payload_json === expectedStub && this.shouldRecordEvent(row.event_type)) continue;
+      try {
+        JSON.parse(row.payload_json);
+      } catch {
+        malformed += 1;
+      }
+    }
+    return malformed;
+  }
+
+  private diagnoseSummarySession(session: NormalizedSession): DoctorSessionIssue | undefined {
+    const issues: string[] = [];
+    const archived = this.getArchivedMessages(session.messages);
+    const state = safeQueryOne<SummaryStateRow>(
+      this.getDb().prepare('SELECT * FROM summary_state WHERE session_id = ?'),
+      [session.sessionID],
+      'diagnoseSummarySession',
+    );
+    const summaryNodeCount = safeQueryOne<{ count: number }>(
+      this.getDb().prepare('SELECT COUNT(*) AS count FROM summary_nodes WHERE session_id = ?'),
+      [session.sessionID],
+      'diagnoseSummarySession.nodeCount',
+    ) ?? { count: 0 };
+    const summaryEdgeCount = safeQueryOne<{ count: number }>(
+      this.getDb().prepare('SELECT COUNT(*) AS count FROM summary_edges WHERE session_id = ?'),
+      [session.sessionID],
+      'diagnoseSummarySession.edgeCount',
+    ) ?? { count: 0 };
+
+    if (archived.length === 0) {
+      if (state) issues.push('unexpected-summary-state');
+      if (summaryNodeCount.count > 0) issues.push('unexpected-summary-nodes');
+      if (summaryEdgeCount.count > 0) issues.push('unexpected-summary-edges');
+      return issues.length > 0 ? { sessionID: session.sessionID, issues } : undefined;
+    }
+
+    const latestMessageCreated = messageCreatedAt(archived.at(-1));
+    const archivedSignature = this.buildArchivedSignature(archived);
+    const rootIDs = state ? parseJson<string[]>(state.root_node_ids_json) : [];
+    const roots = rootIDs
+      .map((nodeID) => this.readSummaryNodeSync(nodeID))
+      .filter((node): node is SummaryNodeData => Boolean(node));
+
+    if (!state) {
+      issues.push('missing-summary-state');
+    } else {
+      if (state.archived_count !== archived.length) issues.push('archived-count-mismatch');
+      if (state.latest_message_created !== latestMessageCreated)
+        issues.push('latest-message-mismatch');
+      if (state.archived_signature !== archivedSignature)
+        issues.push('archived-signature-mismatch');
+      if (rootIDs.length === 0) issues.push('missing-root-node-ids');
+      if (roots.length !== rootIDs.length) {
+        issues.push('missing-root-node-record');
+      } else if (
+        rootIDs.length > 0 &&
+        !this.canReuseSummaryGraphSync(session.sessionID, archived, roots)
+      ) {
+        issues.push('invalid-summary-graph');
+      }
+    }
+
+    if (summaryNodeCount.count === 0) issues.push('missing-summary-nodes');
+    return issues.length > 0 ? { sessionID: session.sessionID, issues } : undefined;
+  }
+
+  private needsLineageRefresh(session: NormalizedSession): boolean {
+    const chain = this.readLineageChainSync(session.sessionID);
+    const expectedRoot = chain[0]?.sessionID ?? session.sessionID;
+    const expectedDepth = Math.max(0, chain.length - 1);
+    return (
+      (session.rootSessionID ?? session.sessionID) !== expectedRoot ||
+      (session.lineageDepth ?? 0) !== expectedDepth
+    );
+  }
+
+  private rebuildSummarySessionsSync(sessionIDs: string[]): void {
+    for (const sessionID of sessionIDs) {
+      const session = this.readSessionSync(sessionID);
+      this.ensureSummaryGraphSync(sessionID, this.getArchivedMessages(session.messages));
+    }
+  }
+
+  private countScopedFtsRows(
+    table: 'message_fts' | 'summary_fts' | 'artifact_fts',
+    sessionIDs?: string[],
+  ): number {
+    if (sessionIDs && sessionIDs.length === 0) return 0;
+
+    if (!sessionIDs) {
+      const row = this.getDb().prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as {
+        count: number;
+      };
+      return row.count;
+    }
+
+    const placeholders = sessionIDs.map(() => '?').join(', ');
+    const row = this.getDb()
+      .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id IN (${placeholders})`)
+      .get(...sessionIDs) as { count: number };
+    return row.count;
+  }
+
+  private countScopedOrphanSummaryEdges(sessionIDs?: string[]): number {
+    if (sessionIDs && sessionIDs.length === 0) return 0;
+
+    const scopeClause = sessionIDs
+      ? `e.session_id IN (${sessionIDs.map(() => '?').join(', ')}) AND `
+      : '';
+    const row = this.getDb()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM summary_edges e
+         WHERE ${scopeClause}(
+           NOT EXISTS (SELECT 1 FROM summary_nodes parent WHERE parent.node_id = e.parent_id)
+           OR NOT EXISTS (SELECT 1 FROM summary_nodes child WHERE child.node_id = e.child_id)
+         )`,
+      )
+      .get(...(sessionIDs ?? [])) as { count: number };
+    return row.count;
+  }
+
+  private shouldRefreshLineageForEvent(eventType: string): boolean {
+    return (
+      eventType === 'session.created' ||
+      eventType === 'session.updated' ||
+      eventType === 'session.deleted'
+    );
+  }
+
+  private shouldPersistSessionForEvent(eventType: string): boolean {
+    return (
+      eventType === 'session.created' ||
+      eventType === 'session.updated' ||
+      eventType === 'session.deleted' ||
+      eventType === 'session.compacted' ||
+      eventType === 'message.updated' ||
+      eventType === 'message.removed' ||
+      eventType === 'message.part.updated' ||
+      eventType === 'message.part.removed'
+    );
+  }
+
+  private shouldRecordEvent(eventType: string): boolean {
+    if (this.shouldPersistSessionForEvent(eventType)) return true;
+
+    return (
+      eventType === 'session.error' ||
+      eventType === 'permission.asked' ||
+      eventType === 'permission.replied' ||
+      eventType === 'question.asked' ||
+      eventType === 'question.replied'
+    );
+  }
+
+  private shouldSyncDerivedLineageSubtree(
+    eventType: string,
+    previousParentSessionID?: string,
+    nextParentSessionID?: string,
+  ): boolean {
+    return (
+      eventType === 'session.created' ||
+      (eventType === 'session.updated' && previousParentSessionID !== nextParentSessionID)
+    );
+  }
+
+  private shouldCleanupOrphanBlobsForEvent(eventType: string): boolean {
+    return (
+      eventType === 'message.removed' ||
+      eventType === 'message.part.updated' ||
+      eventType === 'message.part.removed'
+    );
+  }
+
+  private shouldSyncDerivedSessionStateForEvent(
+    session: NormalizedSession,
+    event: CapturedEvent,
+  ): boolean {
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case 'message.updated': {
+        const existing = session.messages.find(
+          (message) => message.info.id === payload.properties.info.id,
+        );
+        if (existing) {
+          return this.isMessageArchivedSync(
+            session.sessionID,
+            existing.info.id,
+            messageCreatedAt(existing),
+          );
+        }
+
+        return this.readMessageCountSync(session.sessionID) >= this.options.freshTailMessages;
+      }
+      case 'message.removed': {
+        const existing = safeQueryOne<{ created_at: number }>(
+          this.getDb().prepare(
+            'SELECT created_at FROM messages WHERE session_id = ? AND message_id = ?',
+          ),
+          [session.sessionID, payload.properties.messageID],
+          'shouldSyncDerivedSessionStateForEvent.messageRemoved',
+        );
+        if (!existing) return false;
+        return this.readMessageCountSync(session.sessionID) > this.options.freshTailMessages;
+      }
+      case 'message.part.updated': {
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.part.messageID,
+        );
+        if (!message) return false;
+        return this.isMessageArchivedSync(
+          session.sessionID,
+          message.info.id,
+          messageCreatedAt(message),
+        );
+      }
+      case 'message.part.removed': {
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.messageID,
+        );
+        if (!message) return false;
+        return this.isMessageArchivedSync(
+          session.sessionID,
+          message.info.id,
+          messageCreatedAt(message),
+        );
+      }
+      default:
+        return false;
+    }
+  }
+
+  private syncAllDerivedSessionStateSync(preserveExistingResume = false): void {
+    for (const session of this.readAllSessionsSync()) {
+      this.syncDerivedSessionStateSync(session, preserveExistingResume);
+    }
+  }
+
+  private syncDerivedSessionStateSync(
+    session: NormalizedSession,
+    preserveExistingResume = false,
+  ): SummaryNodeData[] {
+    const sanitizedSession = this.sanitizeSessionMessages(session, 'syncDerivedSessionStateSync');
+    const roots = this.ensureSummaryGraphSync(
+      sanitizedSession.sessionID,
+      this.getArchivedMessages(sanitizedSession.messages),
+    );
+    this.writeResumeSync(sanitizedSession, roots, preserveExistingResume);
+    return roots;
+  }
+
+  private syncDerivedLineageSubtreeSync(sessionID: string, preserveExistingResume = false): void {
+    const queue = [sessionID];
+    const seen = new Set<string>([sessionID]);
+
+    while (queue.length > 0) {
+      const currentSessionID = queue.shift();
+      if (!currentSessionID) continue;
+
+      if (currentSessionID !== sessionID) {
+        this.syncDerivedSessionStateSync(
+          this.readSessionSync(currentSessionID),
+          preserveExistingResume,
+        );
+      }
+
+      for (const child of this.readChildSessionsSync(currentSessionID)) {
+        if (seen.has(child.sessionID)) continue;
+        seen.add(child.sessionID);
+        queue.push(child.sessionID);
+      }
+    }
+  }
+
+  private writeResumeSync(
+    session: NormalizedSession,
+    roots: SummaryNodeData[],
+    preserveExistingResume = false,
+  ): void {
+    const db = this.getDb();
+    if (session.messages.length === 0) {
+      db.prepare('DELETE FROM resumes WHERE session_id = ?').run(session.sessionID);
+      return;
+    }
+
+    const existing = this.getResumeSync(session.sessionID);
+    if (preserveExistingResume && existing && !this.isManagedResumeNote(existing)) {
+      return;
+    }
+
+    const note = this.buildResumeNote(session, roots);
+    db.prepare(
+      `INSERT INTO resumes (session_id, note, updated_at)
+       VALUES (?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`,
+    ).run(session.sessionID, note, Date.now());
+  }
+
+  private isManagedResumeNote(note: string): boolean {
+    return note.startsWith('LCM prototype resume note\n') || note === 'LCM prototype resume note';
+  }
+
+  private resolveRetentionPolicy(input?: {
+    staleSessionDays?: number;
+    deletedSessionDays?: number;
+    orphanBlobDays?: number;
+  }): ResolvedRetentionPolicy {
+    return {
+      staleSessionDays: input?.staleSessionDays ?? this.options.retention.staleSessionDays,
+      deletedSessionDays: input?.deletedSessionDays ?? this.options.retention.deletedSessionDays,
+      orphanBlobDays: input?.orphanBlobDays ?? this.options.retention.orphanBlobDays,
+    };
+  }
+
+  private retentionCutoff(days: number): number {
+    return Date.now() - days * 24 * 60 * 60 * 1000;
+  }
+
+  private applyRetentionPruneSync(input?: {
+    staleSessionDays?: number;
+    deletedSessionDays?: number;
+    orphanBlobDays?: number;
+    apply?: boolean;
+  }): { deletedSessions: number; deletedBlobs: number; deletedBlobChars: number } {
+    const policy = this.resolveRetentionPolicy(input);
+
+    if (input?.apply === false) {
+      return { deletedSessions: 0, deletedBlobs: 0, deletedBlobChars: 0 };
+    }
+
+    const staleSessions =
+      policy.staleSessionDays === undefined
+        ? []
+        : this.readSessionRetentionCandidates(false, policy.staleSessionDays);
+    const deletedSessions =
+      policy.deletedSessionDays === undefined
+        ? []
+        : this.readSessionRetentionCandidates(true, policy.deletedSessionDays);
+    const combinedSessions = [...staleSessions, ...deletedSessions];
+    const uniqueSessionIDs = [...new Set(combinedSessions.map((row) => row.session_id))];
+    const initialOrphanBlobs =
+      policy.orphanBlobDays === undefined
+        ? []
+        : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
+
+    if (uniqueSessionIDs.length === 0 && initialOrphanBlobs.length === 0) {
+      return { deletedSessions: 0, deletedBlobs: 0, deletedBlobChars: 0 };
+    }
+
+    const db = this.getDb();
+    let deletedBlobs: RetentionBlobCandidate[] = [];
+    withTransaction(db, 'retentionPrune', () => {
+      for (const sessionID of uniqueSessionIDs) {
+        this.clearSessionDataSync(sessionID);
+      }
+
+      deletedBlobs =
+        policy.orphanBlobDays === undefined
+          ? []
+          : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
+      if (deletedBlobs.length > 0) {
+        const deleteBlob = db.prepare('DELETE FROM artifact_blobs WHERE content_hash = ?');
+        for (const blob of deletedBlobs) deleteBlob.run(blob.content_hash);
+      }
+    });
+
+    if (uniqueSessionIDs.length > 0) {
+      this.refreshAllLineageSync();
+      this.syncAllDerivedSessionStateSync(true);
+      this.refreshSearchIndexesSync();
+    }
+
+    return {
+      deletedSessions: uniqueSessionIDs.length,
+      deletedBlobs: deletedBlobs.length,
+      deletedBlobChars: deletedBlobs.reduce((sum, row) => sum + row.char_count, 0),
+    };
+  }
+
+  private formatRetentionSessionCandidate(row: RetentionSessionCandidate): string {
+    const title = row.title ?? 'Untitled session';
+    const worktree = normalizeWorktreeKey(row.session_directory ?? undefined) ?? 'unknown';
+    const root = row.root_session_id ?? row.session_id;
+    return `- ${row.session_id} pinned=${row.pinned === 1 ? 'true' : 'false'} deleted=${row.deleted === 1 ? 'true' : 'false'} updated_at=${row.updated_at} messages=${row.message_count} artifacts=${row.artifact_count} root=${root} worktree=${worktree} title=${title}`;
+  }
+
+  private readSessionRetentionCandidates(
+    deleted: boolean,
+    days: number,
+    limit?: number,
+  ): RetentionSessionCandidate[] {
+    const params: Array<number | string> = [this.retentionCutoff(days), deleted ? 1 : 0];
+    const sql = `
+      SELECT
+        s.session_id,
+        s.title,
+        s.session_directory,
+        s.root_session_id,
+        s.pinned,
+        s.deleted,
+        s.updated_at,
+        s.event_count,
+        (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.session_id) AS message_count,
+        (SELECT COUNT(*) FROM artifacts a WHERE a.session_id = s.session_id) AS artifact_count
+      FROM sessions s
+      WHERE s.updated_at <= ?
+        AND s.deleted = ?
+        AND s.pinned = 0
+        AND NOT EXISTS (
+          SELECT 1 FROM sessions child WHERE child.parent_session_id = s.session_id
+        )
+      ORDER BY s.updated_at ASC
+      ${limit ? 'LIMIT ?' : ''}`;
+
+    if (limit) params.push(limit);
+    return this.getDb()
+      .prepare(sql)
+      .all(...params) as RetentionSessionCandidate[];
+  }
+
+  private countSessionRetentionCandidates(deleted: boolean, days: number): number {
+    const row = this.getDb()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM sessions s
+         WHERE s.updated_at <= ?
+           AND s.deleted = ?
+           AND s.pinned = 0
+           AND NOT EXISTS (
+             SELECT 1 FROM sessions child WHERE child.parent_session_id = s.session_id
+           )`,
+      )
+      .get(this.retentionCutoff(days), deleted ? 1 : 0) as { count: number };
+    return row.count;
+  }
+
+  private readOrphanBlobRetentionCandidates(
+    days: number,
+    limit?: number,
+  ): RetentionBlobCandidate[] {
+    this.refreshOrphanedArtifactBlobsSync();
+    const params: Array<number> = [this.retentionCutoff(days)];
+    const sql = `
+      SELECT content_hash, char_count, created_at
+      FROM artifact_blobs b
+      WHERE b.orphaned_at <= ?
+        AND NOT EXISTS (
+          SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+        )
+      ORDER BY char_count DESC, created_at ASC
+      ${limit ? 'LIMIT ?' : ''}`;
+    if (limit) params.push(limit);
+    return this.getDb()
+      .prepare(sql)
+      .all(...params) as RetentionBlobCandidate[];
+  }
+
+  private countOrphanBlobRetentionCandidates(days: number): number {
+    this.refreshOrphanedArtifactBlobsSync();
+    const row = this.getDb()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM artifact_blobs b
+         WHERE b.orphaned_at <= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+           )`,
+      )
+      .get(this.retentionCutoff(days)) as { count: number };
+    return row.count;
+  }
+
+  private sumOrphanBlobRetentionChars(days: number): number {
+    this.refreshOrphanedArtifactBlobsSync();
+    const row = this.getDb()
+      .prepare(
+        `SELECT COALESCE(SUM(char_count), 0) AS chars
+         FROM artifact_blobs b
+         WHERE b.orphaned_at <= ?
+           AND NOT EXISTS (
+             SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+           )`,
+      )
+      .get(this.retentionCutoff(days)) as { chars: number };
+    return row.chars;
+  }
+
+  private normalizeScope(scope?: string): SnapshotScope | undefined {
+    if (scope === 'session' || scope === 'root' || scope === 'worktree' || scope === 'all')
+      return scope;
+    return undefined;
+  }
+
+  private resolveConfiguredScope(
+    operation: 'grep' | 'describe',
+    explicitScope?: string,
+    sessionID?: string,
+  ): 'session' | 'root' | 'worktree' | 'all' {
+    const explicit = this.normalizeScope(explicitScope);
+    if (explicit) return explicit;
+
+    const worktreeKey = this.resolveScopeWorktreeKey(sessionID);
+    if (worktreeKey) {
+      const profile = this.options.scopeProfiles.find(
+        (entry) => normalizeWorktreeKey(entry.worktree) === worktreeKey,
+      );
+      if (profile?.[operation]) return profile[operation];
+    }
+
+    return this.options.scopeDefaults[operation];
+  }
+
+  private resolveScopeWorktreeKey(sessionID?: string): string | undefined {
+    if (sessionID) {
+      const session = this.readSessionHeaderSync(sessionID);
+      const sessionWorktree = normalizeWorktreeKey(session?.directory);
+      if (sessionWorktree) return sessionWorktree;
+    }
+
+    return normalizeWorktreeKey(this.workspaceDirectory);
+  }
+
+  private resolveScopeSessionIDs(scope?: string, sessionID?: string): string[] | undefined {
+    const normalizedScope = this.normalizeScope(scope) ?? this.options.scopeDefaults.grep;
+    if (normalizedScope === 'all') return undefined;
+
+    const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
+    if (!resolvedSessionID) return [];
+    if (normalizedScope === 'session') return [resolvedSessionID];
+
+    const session = this.readSessionHeaderSync(resolvedSessionID);
+    if (!session) return [];
+
+    if (normalizedScope === 'root') {
+      const rootSessionID = session.rootSessionID ?? session.sessionID;
+      const rows = this.getDb()
+        .prepare(
+          'SELECT session_id FROM sessions WHERE root_session_id = ? OR session_id = ? ORDER BY updated_at DESC',
+        )
+        .all(rootSessionID, rootSessionID) as Array<{ session_id: string }>;
+      return [...new Set(rows.map((row) => row.session_id))];
+    }
+
+    const worktreeKey = normalizeWorktreeKey(session.directory);
+    if (!worktreeKey) return [resolvedSessionID];
+    const rows = this.getDb()
+      .prepare('SELECT session_id FROM sessions WHERE worktree_key = ? ORDER BY updated_at DESC')
+      .all(worktreeKey) as Array<{ session_id: string }>;
+    return [...new Set(rows.map((row) => row.session_id))];
+  }
+
+  private readScopedSessionRowsSync(sessionIDs?: string[]): SessionRow[] {
+    if (!sessionIDs) {
+      return this.getDb()
+        .prepare('SELECT * FROM sessions ORDER BY updated_at DESC')
+        .all() as SessionRow[];
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT * FROM sessions WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY updated_at DESC`,
+      )
+      .all(...sessionIDs) as SessionRow[];
+  }
+
+  private readScopedMessageRowsSync(sessionIDs?: string[]): MessageRow[] {
+    if (!sessionIDs) {
+      return this.getDb()
+        .prepare('SELECT * FROM messages ORDER BY created_at ASC, message_id ASC')
+        .all() as MessageRow[];
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT * FROM messages WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY created_at ASC, message_id ASC`,
+      )
+      .all(...sessionIDs) as MessageRow[];
+  }
+
+  private readScopedPartRowsSync(sessionIDs?: string[]): PartRow[] {
+    if (!sessionIDs) {
+      return this.getDb()
+        .prepare('SELECT * FROM parts ORDER BY message_id ASC, sort_key ASC, part_id ASC')
+        .all() as PartRow[];
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT * FROM parts WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY message_id ASC, sort_key ASC, part_id ASC`,
+      )
+      .all(...sessionIDs) as PartRow[];
+  }
+
+  private readScopedResumeRowsSync(
+    sessionIDs?: string[],
+  ): Array<{ session_id: string; note: string; updated_at: number }> {
+    if (!sessionIDs) {
+      return this.getDb().prepare('SELECT * FROM resumes ORDER BY updated_at DESC').all() as Array<{
+        session_id: string;
+        note: string;
+        updated_at: number;
+      }>;
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT * FROM resumes WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY updated_at DESC`,
+      )
+      .all(...sessionIDs) as Array<{ session_id: string; note: string; updated_at: number }>;
+  }
+
+  private readScopedSessionsSync(sessionIDs?: string[]): NormalizedSession[] {
+    if (!sessionIDs) return this.readAllSessionsSync();
+    if (sessionIDs.length === 0) return [];
+    if (sessionIDs.length <= 1) return sessionIDs.map((id) => this.readSessionSync(id));
+
+    return this.readSessionsBatchSync(sessionIDs).filter(
+      (session) => session.messages.length > 0 || session.eventCount > 0,
+    );
+  }
+
+  private readScopedSummaryRowsSync(sessionIDs?: string[]): SummaryNodeRow[] {
+    if (!sessionIDs) {
+      return this.getDb()
+        .prepare('SELECT * FROM summary_nodes ORDER BY created_at DESC')
+        .all() as SummaryNodeRow[];
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT * FROM summary_nodes WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY created_at DESC`,
+      )
+      .all(...sessionIDs) as SummaryNodeRow[];
+  }
+
+  private readScopedSummaryEdgeRowsSync(sessionIDs?: string[]): SummaryEdgeRow[] {
+    if (!sessionIDs) {
+      return this.getDb()
+        .prepare(
+          'SELECT * FROM summary_edges ORDER BY session_id ASC, parent_id ASC, child_position ASC',
+        )
+        .all() as SummaryEdgeRow[];
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT * FROM summary_edges WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY session_id ASC, parent_id ASC, child_position ASC`,
+      )
+      .all(...sessionIDs) as SummaryEdgeRow[];
+  }
+
+  private readScopedSummaryStateRowsSync(sessionIDs?: string[]): SummaryStateRow[] {
+    if (!sessionIDs) {
+      return this.getDb()
+        .prepare('SELECT * FROM summary_state ORDER BY updated_at DESC')
+        .all() as SummaryStateRow[];
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT * FROM summary_state WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY updated_at DESC`,
+      )
+      .all(...sessionIDs) as SummaryStateRow[];
+  }
+
+  private readScopedArtifactRowsSync(sessionIDs?: string[]): ArtifactRow[] {
+    if (!sessionIDs) {
+      return this.getDb()
+        .prepare('SELECT * FROM artifacts ORDER BY created_at DESC')
+        .all() as ArtifactRow[];
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT * FROM artifacts WHERE session_id IN (${sessionIDs.map(() => '?').join(', ')}) ORDER BY created_at DESC`,
+      )
+      .all(...sessionIDs) as ArtifactRow[];
+  }
+
+  private readScopedArtifactBlobRowsSync(sessionIDs?: string[]): ArtifactBlobRow[] {
+    if (!sessionIDs) {
+      return this.getDb()
+        .prepare('SELECT * FROM artifact_blobs ORDER BY created_at ASC')
+        .all() as ArtifactBlobRow[];
+    }
+    if (sessionIDs.length === 0) return [];
+
+    return this.getDb()
+      .prepare(
+        `SELECT DISTINCT b.*
+         FROM artifact_blobs b
+         JOIN artifacts a ON a.content_hash = b.content_hash
+         WHERE a.session_id IN (${sessionIDs.map(() => '?').join(', ')})
+         ORDER BY b.created_at ASC`,
+      )
+      .all(...sessionIDs) as ArtifactBlobRow[];
+  }
+
+  async lineage(sessionID?: string): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
+      if (!resolvedSessionID) return 'No archived sessions yet.';
+
+      const session = this.readSessionSync(resolvedSessionID);
+      const chain = this.readLineageChainSync(resolvedSessionID);
+      const children = this.readChildSessionsSync(resolvedSessionID);
+      const siblings = session.parentSessionID
+        ? this.readChildSessionsSync(session.parentSessionID).filter(
+            (child) => child.sessionID !== resolvedSessionID,
+          )
+        : [];
+
+      return [
+        `Session: ${session.sessionID}`,
+        `Title: ${makeSessionTitle(session) ?? 'Unknown'}`,
+        `Worktree: ${normalizeWorktreeKey(session.directory) ?? 'unknown'}`,
+        `Root session: ${session.rootSessionID ?? session.sessionID}`,
+        `Parent session: ${session.parentSessionID ?? 'none'}`,
+        `Lineage depth: ${session.lineageDepth ?? 0}`,
+        'Lineage chain:',
+        ...chain.map(
+          (entry, index) =>
+            `${entry.sessionID === resolvedSessionID ? '*' : '-'} depth=${index} ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
+        ),
+        ...(siblings.length > 0
+          ? [
+              'Sibling branches:',
+              ...siblings.map(
+                (entry) => `- ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
+              ),
+            ]
+          : []),
+        ...(children.length > 0
+          ? [
+              'Child branches:',
+              ...children.map(
+                (entry) => `- ${entry.sessionID}: ${makeSessionTitle(entry) ?? 'Untitled session'}`,
+              ),
+            ]
+          : []),
+      ].join('\n');
+    });
+  }
+
+  async pinSession(input: { sessionID?: string; reason?: string }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const sessionID = input.sessionID ?? this.latestSessionIDSync();
+        if (!sessionID) return 'No archived sessions yet.';
+
+        const session = this.readSessionHeaderSync(sessionID);
+        if (!session) return 'Unknown session.';
+        const reason = input.reason?.trim() || 'Pinned by user';
+
+        this.getDb()
+          .prepare('UPDATE sessions SET pinned = 1, pin_reason = ? WHERE session_id = ?')
+          .run(reason, sessionID);
+        return [`session=${sessionID}`, 'pinned=true', `reason=${reason}`].join('\n');
+      });
+    });
+  }
+
+  async unpinSession(input: { sessionID?: string }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const sessionID = input.sessionID ?? this.latestSessionIDSync();
+        if (!sessionID) return 'No archived sessions yet.';
+
+        const session = this.readSessionHeaderSync(sessionID);
+        if (!session) return 'Unknown session.';
+        this.getDb()
+          .prepare('UPDATE sessions SET pinned = 0, pin_reason = NULL WHERE session_id = ?')
+          .run(sessionID);
+        return [`session=${sessionID}`, 'pinned=false'].join('\n');
+      });
+    });
+  }
+
+  async artifact(input: { artifactID: string; chars?: number }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const artifact = this.readArtifactSync(input.artifactID);
+      if (!artifact) return 'Unknown artifact.';
+
+      const maxChars = Math.max(
+        200,
+        Math.min(this.options.artifactViewChars, input.chars ?? this.options.artifactViewChars),
+      );
+      return [
+        `Artifact: ${artifact.artifactID}`,
+        `Session: ${artifact.sessionID}`,
+        `Message: ${artifact.messageID}`,
+        `Part: ${artifact.partID}`,
+        `Kind: ${artifact.artifactKind}`,
+        `Field: ${artifact.fieldName}`,
+        `Content hash: ${artifact.contentHash}`,
+        `Characters: ${artifact.charCount}`,
+        ...this.formatArtifactMetadataLines(artifact.metadata),
+        'Preview:',
+        truncate(artifact.previewText, this.options.artifactPreviewChars),
+        'Content:',
+        truncate(artifact.contentText, maxChars),
+      ].join('\n');
+    });
+  }
+
+  async blobStats(input?: { limit?: number }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const limit = clamp(input?.limit ?? 5, 1, 20);
+      const db = this.getDb();
+      const totals = db
+        .prepare(
+          `SELECT
+           COUNT(*) AS blob_count,
+           COALESCE(SUM(char_count), 0) AS blob_chars,
+           COALESCE(SUM(CASE WHEN EXISTS (SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash) THEN 0 ELSE char_count END), 0) AS orphan_chars
+         FROM artifact_blobs b`,
+        )
+        .get() as { blob_count: number; blob_chars: number; orphan_chars: number };
+      const referenced = db
+        .prepare(
+          'SELECT COUNT(DISTINCT content_hash) AS count FROM artifacts WHERE content_hash IS NOT NULL',
+        )
+        .get() as { count: number };
+      const sharedCount = db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM (
+           SELECT content_hash FROM artifacts
+           WHERE content_hash IS NOT NULL
+           GROUP BY content_hash
+           HAVING COUNT(*) > 1
+         )`,
+        )
+        .get() as { count: number };
+      const orphanCount = db
+        .prepare(
+          `SELECT COUNT(*) AS count FROM artifact_blobs b
+         WHERE NOT EXISTS (
+           SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+         )`,
+        )
+        .get() as { count: number };
+      const shared = db
+        .prepare(
+          `SELECT a.content_hash AS content_hash, COUNT(*) AS ref_count, MAX(b.char_count) AS char_count
+         FROM artifacts a
+         JOIN artifact_blobs b ON b.content_hash = a.content_hash
+         WHERE a.content_hash IS NOT NULL
+         GROUP BY a.content_hash
+         HAVING COUNT(*) > 1
+         ORDER BY ref_count DESC, char_count DESC
+         LIMIT ?`,
+        )
+        .all(limit) as Array<{ content_hash: string; ref_count: number; char_count: number }>;
+      const orphan = db
+        .prepare(
+          `SELECT content_hash, char_count, created_at
+         FROM artifact_blobs b
+         WHERE NOT EXISTS (
+           SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+         )
+         ORDER BY char_count DESC, created_at ASC
+         LIMIT ?`,
+        )
+        .all(limit) as Array<{ content_hash: string; char_count: number; created_at: number }>;
+      const saved = db
+        .prepare(
+          `SELECT COALESCE(SUM((ref_count - 1) * char_count), 0) AS chars_saved FROM (
+           SELECT a.content_hash AS content_hash, COUNT(*) AS ref_count, MAX(b.char_count) AS char_count
+           FROM artifacts a
+           JOIN artifact_blobs b ON b.content_hash = a.content_hash
+           WHERE a.content_hash IS NOT NULL
+           GROUP BY a.content_hash
+           HAVING COUNT(*) > 1
+         )`,
+        )
+        .get() as { chars_saved: number };
+
+      return [
+        `artifact_blobs=${totals.blob_count}`,
+        `referenced_blobs=${referenced.count}`,
+        `shared_blobs=${sharedCount.count}`,
+        `orphan_blobs=${orphanCount.count}`,
+        `blob_chars=${totals.blob_chars}`,
+        `orphan_blob_chars=${totals.orphan_chars}`,
+        `saved_chars_from_dedup=${saved.chars_saved}`,
+        ...(shared.length > 0
+          ? [
+              'top_shared_blobs:',
+              ...shared.map(
+                (row) =>
+                  `- ${row.content_hash.slice(0, 16)} refs=${row.ref_count} chars=${row.char_count}`,
+              ),
+            ]
+          : ['top_shared_blobs:', '- none']),
+        ...(orphan.length > 0
+          ? [
+              'orphan_blobs_preview:',
+              ...orphan.map(
+                (row) =>
+                  `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+              ),
+            ]
+          : ['orphan_blobs_preview:', '- none']),
+      ].join('\n');
+    });
+  }
+
+  private deleteOrphanArtifactBlobsSync(gracePeriodMs?: number): RetentionBlobCandidate[] {
+    const db = this.getDb();
+    let orphanRows: RetentionBlobCandidate[] = [];
+    withTransaction(db, 'deleteOrphanBlobs', () => {
+      this.refreshOrphanedArtifactBlobsSync();
+      orphanRows = this.selectOrphanBlobsForDeletionSync(gracePeriodMs, false);
+      if (orphanRows.length === 0) return;
+
+      const cutoff = gracePeriodMs === undefined ? undefined : Date.now() - gracePeriodMs;
+      const cutoffClause = cutoff === undefined ? '' : ' AND orphaned_at <= ?';
+      const params = cutoff === undefined ? [] : [cutoff];
+      db.prepare(
+        `DELETE FROM artifact_blobs
+         WHERE NOT EXISTS (
+           SELECT 1 FROM artifacts a WHERE a.content_hash = artifact_blobs.content_hash
+         )${cutoffClause}`,
+      ).run(...params);
+    });
+
+    return orphanRows;
+  }
+
+  private selectOrphanBlobsForDeletionSync(
+    gracePeriodMs?: number,
+    refresh = true,
+  ): RetentionBlobCandidate[] {
+    if (refresh) this.refreshOrphanedArtifactBlobsSync();
+    const cutoff = gracePeriodMs === undefined ? undefined : Date.now() - gracePeriodMs;
+    const cutoffClause = cutoff === undefined ? '' : ' AND b.orphaned_at <= ?';
+    const params = cutoff === undefined ? [] : [cutoff];
+    return this.getDb()
+      .prepare(
+        `SELECT content_hash, char_count, created_at
+         FROM artifact_blobs b
+         WHERE NOT EXISTS (
+           SELECT 1 FROM artifacts a WHERE a.content_hash = b.content_hash
+         )${cutoffClause}
+         ORDER BY char_count DESC, created_at ASC`,
+      )
+      .all(...params) as RetentionBlobCandidate[];
+  }
+
+  private refreshOrphanedArtifactBlobsSync(): void {
+    const db = this.getDb();
+    const now = Date.now();
+    db.prepare(
+      `UPDATE artifact_blobs
+       SET orphaned_at = COALESCE(orphaned_at, ?)
+       WHERE orphaned_at IS NULL
+         AND NOT EXISTS (
+         SELECT 1 FROM artifacts a WHERE a.content_hash = artifact_blobs.content_hash
+       )`,
+    ).run(now);
+    db.prepare(
+      `UPDATE artifact_blobs
+       SET orphaned_at = NULL
+       WHERE orphaned_at IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM artifacts a WHERE a.content_hash = artifact_blobs.content_hash
+         )`,
+    ).run();
+  }
+
+  private orphanBlobGracePeriodMs(): number | undefined {
+    const days = this.options.retention.orphanBlobDays;
+    return days === undefined ? undefined : days * 24 * 60 * 60 * 1000;
+  }
+
+  async gcBlobs(input?: { apply?: boolean; limit?: number }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const apply = input?.apply ?? false;
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const gracePeriodMs = this.orphanBlobGracePeriodMs();
+        const orphanRows = this.selectOrphanBlobsForDeletionSync(gracePeriodMs);
+
+        const totalChars = orphanRows.reduce((sum, row) => sum + row.char_count, 0);
+        if (orphanRows.length === 0) {
+          return ['orphan_blobs=0', 'deleted_blobs=0', 'deleted_blob_chars=0', 'status=clean'].join(
+            '\n',
+          );
+        }
+
+        if (!apply) {
+          return [
+            `orphan_blobs=${orphanRows.length}`,
+            `orphan_blob_chars=${totalChars}`,
+            'status=dry-run',
+            'preview:',
+            ...orphanRows
+              .slice(0, limit)
+              .map(
+                (row) =>
+                  `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+              ),
+            'Re-run with apply=true to delete orphan blobs.',
+          ].join('\n');
+        }
+
+        this.deleteOrphanArtifactBlobsSync(gracePeriodMs);
+
+        return [
+          `orphan_blobs=${orphanRows.length}`,
+          `deleted_blobs=${orphanRows.length}`,
+          `deleted_blob_chars=${totalChars}`,
+          'status=applied',
+          'deleted_preview:',
+          ...orphanRows
+            .slice(0, limit)
+            .map(
+              (row) =>
+                `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+            ),
+        ].join('\n');
+      });
+    });
+  }
+
+  private readPrunableEventTypeCountsSync(): Array<{ eventType: string; count: number }> {
+    const rows = this.getDb()
+      .prepare(
+        'SELECT event_type, COUNT(*) AS count FROM events GROUP BY event_type ORDER BY count DESC',
+      )
+      .all() as Array<{ event_type: string; count: number }>;
+
+    return rows
+      .filter((row) => !this.shouldRecordEvent(row.event_type))
+      .map((row) => ({
+        eventType: row.event_type,
+        count: row.count,
+      }));
+  }
+
+  private async readStoreFileSizes(): Promise<{
+    dbBytes: number;
+    walBytes: number;
+    shmBytes: number;
+    totalBytes: number;
+  }> {
+    const readBytes = async (filePath: string): Promise<number> => {
+      try {
+        return (await stat(filePath)).size;
+      } catch {
+        return 0;
+      }
+    };
+
+    const dbBytes = await readBytes(this.dbPath);
+    const walBytes = await readBytes(`${this.dbPath}-wal`);
+    const shmBytes = await readBytes(`${this.dbPath}-shm`);
+
+    return {
+      dbBytes,
+      walBytes,
+      shmBytes,
+      totalBytes: dbBytes + walBytes + shmBytes,
+    };
+  }
+
+  private readStorageMetricsSync(): {
+    pageSize: number;
+    pageCount: number;
+    freelistCount: number;
+    freeBytes: number;
+    freeRatio: number;
+  } {
+    const db = this.getDb();
+    const pageSize = firstFiniteNumber(db.prepare('PRAGMA page_size').get()) ?? 4096;
+    const pageCount = firstFiniteNumber(db.prepare('PRAGMA page_count').get()) ?? 0;
+    const freelistCount = firstFiniteNumber(db.prepare('PRAGMA freelist_count').get()) ?? 0;
+    const freeBytes = freelistCount * pageSize;
+    const freeRatio = pageCount > 0 ? freelistCount / pageCount : 0;
+    return { pageSize, pageCount, freelistCount, freeBytes, freeRatio };
+  }
+
+  async compactEventLog(input?: {
+    apply?: boolean;
+    vacuum?: boolean;
+    limit?: number;
+  }): Promise<string> {
+    return this.compact(input);
+  }
+
+  async compact(input?: { apply?: boolean; vacuum?: boolean; limit?: number }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const apply = input?.apply ?? false;
+        const vacuumMode =
+          input?.vacuum === true ? 'force' : input?.vacuum === false ? 'off' : 'auto';
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const beforeSizes = await this.readStoreFileSizes();
+        const candidates = this.readPrunableEventTypeCountsSync();
+        const candidateEvents = candidates.reduce((sum, row) => sum + row.count, 0);
+        const metrics = this.readStorageMetricsSync();
+
+        if (!apply) {
+          return [
+            `candidate_events=${candidateEvents}`,
+            `apply=false`,
+            `vacuum_mode=${vacuumMode}`,
+            `vacuum_threshold=${SqliteLcmStore.compactFreeRatioThreshold.toFixed(2)}`,
+            `page_size=${metrics.pageSize}`,
+            `page_count=${metrics.pageCount}`,
+            `freelist_count=${metrics.freelistCount}`,
+            `free_bytes=${metrics.freeBytes}`,
+            `free_ratio=${metrics.freeRatio.toFixed(4)}`,
+            `db_bytes=${beforeSizes.dbBytes}`,
+            `wal_bytes=${beforeSizes.walBytes}`,
+            `shm_bytes=${beforeSizes.shmBytes}`,
+            `total_bytes=${beforeSizes.totalBytes}`,
+            ...(candidates.length > 0
+              ? [
+                  'candidate_event_types:',
+                  ...candidates
+                    .slice(0, limit)
+                    .map((row) => `- ${row.eventType} count=${row.count}`),
+                ]
+              : ['candidate_event_types:', '- none']),
+          ].join('\n');
+        }
+
+        if (candidateEvents > 0) {
+          const eventTypes = candidates.map((row) => row.eventType);
+          const placeholders = eventTypes.map(() => '?').join(', ');
+          this.getDb()
+            .prepare(`DELETE FROM events WHERE event_type IN (${placeholders})`)
+            .run(...eventTypes);
+        }
+
+        const decisionMetrics = this.readStorageMetricsSync();
+        const shouldVacuum =
+          vacuumMode === 'force' ||
+          (vacuumMode === 'auto' &&
+            decisionMetrics.freeRatio >= SqliteLcmStore.compactFreeRatioThreshold);
+        const vacuumReason =
+          vacuumMode === 'force'
+            ? 'requested'
+            : shouldVacuum
+              ? 'free-ratio'
+              : vacuumMode === 'off'
+                ? 'disabled'
+                : 'below-threshold';
+
+        this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+        let vacuumApplied = false;
+        if (shouldVacuum) {
+          this.getDb().exec('VACUUM');
+          this.getDb().exec('PRAGMA wal_checkpoint(TRUNCATE)');
+          vacuumApplied = true;
+        }
+
+        const afterMetrics = this.readStorageMetricsSync();
+        const afterSizes = await this.readStoreFileSizes();
+
+        return [
+          `candidate_events=${candidateEvents}`,
+          `deleted_events=${candidateEvents}`,
+          `apply=true`,
+          `vacuum_mode=${vacuumMode}`,
+          `vacuum_applied=${vacuumApplied}`,
+          `vacuum_reason=${vacuumReason}`,
+          `page_size=${metrics.pageSize}`,
+          `page_count_before=${metrics.pageCount}`,
+          `freelist_count_before=${metrics.freelistCount}`,
+          `free_bytes_before=${metrics.freeBytes}`,
+          `free_ratio_before=${metrics.freeRatio.toFixed(4)}`,
+          `page_count_after=${afterMetrics.pageCount}`,
+          `freelist_count_after=${afterMetrics.freelistCount}`,
+          `free_bytes_after=${afterMetrics.freeBytes}`,
+          `free_ratio_after=${afterMetrics.freeRatio.toFixed(4)}`,
+          `db_bytes_before=${beforeSizes.dbBytes}`,
+          `wal_bytes_before=${beforeSizes.walBytes}`,
+          `shm_bytes_before=${beforeSizes.shmBytes}`,
+          `total_bytes_before=${beforeSizes.totalBytes}`,
+          `db_bytes_after=${afterSizes.dbBytes}`,
+          `wal_bytes_after=${afterSizes.walBytes}`,
+          `shm_bytes_after=${afterSizes.shmBytes}`,
+          `total_bytes_after=${afterSizes.totalBytes}`,
+          ...(candidates.length > 0
+            ? [
+                'deleted_event_types:',
+                ...candidates.slice(0, limit).map((row) => `- ${row.eventType} count=${row.count}`),
+              ]
+            : ['deleted_event_types:', '- none']),
+        ].join('\n');
+      });
+    });
+  }
+
+  async retentionReport(input?: {
+    staleSessionDays?: number;
+    deletedSessionDays?: number;
+    orphanBlobDays?: number;
+    limit?: number;
+  }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const policy = this.resolveRetentionPolicy(input);
+        const staleSessions =
+          policy.staleSessionDays === undefined
+            ? []
+            : this.readSessionRetentionCandidates(false, policy.staleSessionDays, limit);
+        const deletedSessions =
+          policy.deletedSessionDays === undefined
+            ? []
+            : this.readSessionRetentionCandidates(true, policy.deletedSessionDays, limit);
+        const orphanBlobs =
+          policy.orphanBlobDays === undefined
+            ? []
+            : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays, limit);
+
+        const totalStaleSessions =
+          policy.staleSessionDays === undefined
+            ? 0
+            : this.countSessionRetentionCandidates(false, policy.staleSessionDays);
+        const totalDeletedSessions =
+          policy.deletedSessionDays === undefined
+            ? 0
+            : this.countSessionRetentionCandidates(true, policy.deletedSessionDays);
+        const totalOrphanBlobs =
+          policy.orphanBlobDays === undefined
+            ? 0
+            : this.countOrphanBlobRetentionCandidates(policy.orphanBlobDays);
+        const orphanBlobChars =
+          policy.orphanBlobDays === undefined
+            ? 0
+            : this.sumOrphanBlobRetentionChars(policy.orphanBlobDays);
+
+        return [
+          `stale_session_days=${formatRetentionDays(policy.staleSessionDays)}`,
+          `deleted_session_days=${formatRetentionDays(policy.deletedSessionDays)}`,
+          `orphan_blob_days=${formatRetentionDays(policy.orphanBlobDays)}`,
+          `stale_session_candidates=${totalStaleSessions}`,
+          `deleted_session_candidates=${totalDeletedSessions}`,
+          `orphan_blob_candidates=${totalOrphanBlobs}`,
+          `orphan_blob_candidate_chars=${orphanBlobChars}`,
+          ...(staleSessions.length > 0
+            ? [
+                'stale_sessions_preview:',
+                ...staleSessions.map((row) => this.formatRetentionSessionCandidate(row)),
+              ]
+            : ['stale_sessions_preview:', '- none']),
+          ...(deletedSessions.length > 0
+            ? [
+                'deleted_sessions_preview:',
+                ...deletedSessions.map((row) => this.formatRetentionSessionCandidate(row)),
+              ]
+            : ['deleted_sessions_preview:', '- none']),
+          ...(orphanBlobs.length > 0
+            ? [
+                'orphan_blobs_preview:',
+                ...orphanBlobs.map(
+                  (row) =>
+                    `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+                ),
+              ]
+            : ['orphan_blobs_preview:', '- none']),
+        ].join('\n');
+      });
+    });
+  }
+
+  async retentionPrune(input?: {
+    staleSessionDays?: number;
+    deletedSessionDays?: number;
+    orphanBlobDays?: number;
+    apply?: boolean;
+    limit?: number;
+  }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const apply = input?.apply ?? false;
+        const limit = clamp(input?.limit ?? 10, 1, 50);
+        const policy = this.resolveRetentionPolicy(input);
+        const staleSessions =
+          policy.staleSessionDays === undefined
+            ? []
+            : this.readSessionRetentionCandidates(false, policy.staleSessionDays);
+        const deletedSessions =
+          policy.deletedSessionDays === undefined
+            ? []
+            : this.readSessionRetentionCandidates(true, policy.deletedSessionDays);
+        const combinedSessions = [...staleSessions, ...deletedSessions];
+        const initialOrphanBlobs =
+          policy.orphanBlobDays === undefined
+            ? []
+            : this.readOrphanBlobRetentionCandidates(policy.orphanBlobDays);
+
+        if (!apply) {
+          return [
+            `stale_session_candidates=${staleSessions.length}`,
+            `deleted_session_candidates=${deletedSessions.length}`,
+            `orphan_blob_candidates=${initialOrphanBlobs.length}`,
+            'status=dry-run',
+            ...(combinedSessions.length > 0
+              ? [
+                  'session_preview:',
+                  ...combinedSessions
+                    .slice(0, limit)
+                    .map((row) => this.formatRetentionSessionCandidate(row)),
+                ]
+              : ['session_preview:', '- none']),
+            ...(initialOrphanBlobs.length > 0
+              ? [
+                  'blob_preview:',
+                  ...initialOrphanBlobs
+                    .slice(0, limit)
+                    .map(
+                      (row) =>
+                        `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+                    ),
+                ]
+              : ['blob_preview:', '- none']),
+            'Re-run with apply=true to prune the candidates above.',
+          ].join('\n');
+        }
+
+        const result = this.applyRetentionPruneSync({ ...input, apply: true });
+
+        let combinedPreview: string[] = [];
+        if (combinedSessions.length > 0) {
+          combinedPreview = [
+            'deleted_sessions_preview:',
+            ...combinedSessions
+              .slice(0, limit)
+              .map((row) => this.formatRetentionSessionCandidate(row)),
+          ];
+        } else {
+          combinedPreview = ['deleted_sessions_preview:', '- none'];
+        }
+
+        let deletedBlobPreview: string[] = [];
+        if (initialOrphanBlobs.length > 0) {
+          deletedBlobPreview = [
+            'deleted_blobs_preview:',
+            ...initialOrphanBlobs
+              .slice(0, limit)
+              .map(
+                (row) =>
+                  `- ${row.content_hash.slice(0, 16)} chars=${row.char_count} created_at=${row.created_at}`,
+              ),
+          ];
+        } else {
+          deletedBlobPreview = ['deleted_blobs_preview:', '- none'];
+        }
+
+        return [
+          `deleted_sessions=${result.deletedSessions}`,
+          `deleted_blobs=${result.deletedBlobs}`,
+          `deleted_blob_chars=${result.deletedBlobChars}`,
+          'status=applied',
+          ...combinedPreview,
+          ...deletedBlobPreview,
+        ].join('\n');
+      });
+    });
+  }
+
+  async exportSnapshot(input: {
+    filePath: string;
+    sessionID?: string;
+    scope?: string;
+  }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return exportStoreSnapshot(
+        {
+          workspaceDirectory: this.workspaceDirectory,
+          normalizeScope: this.normalizeScope.bind(this),
+          resolveScopeSessionIDs: this.resolveScopeSessionIDs.bind(this),
+          readScopedSessionRowsSync: this.readScopedSessionRowsSync.bind(this),
+          readScopedMessageRowsSync: this.readScopedMessageRowsSync.bind(this),
+          readScopedPartRowsSync: this.readScopedPartRowsSync.bind(this),
+          readScopedResumeRowsSync: this.readScopedResumeRowsSync.bind(this),
+          readScopedArtifactRowsSync: this.readScopedArtifactRowsSync.bind(this),
+          readScopedArtifactBlobRowsSync: this.readScopedArtifactBlobRowsSync.bind(this),
+          readScopedSummaryRowsSync: this.readScopedSummaryRowsSync.bind(this),
+          readScopedSummaryEdgeRowsSync: this.readScopedSummaryEdgeRowsSync.bind(this),
+          readScopedSummaryStateRowsSync: this.readScopedSummaryStateRowsSync.bind(this),
+        },
+        input,
+      );
+    });
+  }
+
+  async importSnapshot(input: {
+    filePath: string;
+    mode?: 'replace' | 'merge';
+    worktreeMode?: SnapshotWorktreeMode;
+  }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () =>
+        importStoreSnapshot(
+          {
+            workspaceDirectory: this.workspaceDirectory,
+            getDb: () => this.getDb(),
+            clearSessionDataSync: this.clearSessionDataSync.bind(this),
+            backfillArtifactBlobsSync: this.backfillArtifactBlobsSync.bind(this),
+            refreshAllLineageSync: this.refreshAllLineageSync.bind(this),
+            syncAllDerivedSessionStateSync: this.syncAllDerivedSessionStateSync.bind(this),
+            refreshSearchIndexesSync: this.refreshSearchIndexesSync.bind(this),
+          },
+          input,
+        ),
+      );
+    });
+  }
+
+  async resume(sessionID?: string): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      const resolvedSessionID = sessionID ?? this.latestSessionIDSync();
+      if (!resolvedSessionID) return 'No stored resume snapshots yet.';
+
+      const existing = this.getResumeSync(resolvedSessionID);
+      if (existing && !this.isManagedResumeNote(existing)) return existing;
+
+      const generated = await this.buildCompactionContext(resolvedSessionID);
+      return generated ?? existing ?? 'No stored resume snapshot for that session.';
+    });
+  }
+
+  async expand(input: {
+    sessionID?: string;
+    nodeID?: string;
+    query?: string;
+    depth?: number;
+    messageLimit?: number;
+    includeRaw?: boolean;
+  }): Promise<string> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const depth = clamp(input.depth ?? 1, 1, 4);
+        const messageLimit = clamp(input.messageLimit ?? EXPAND_MESSAGE_LIMIT, 1, 20);
+        const query = input.query?.trim();
+
+        if (!input.nodeID) {
+          const sessionID = input.sessionID ?? this.latestSessionIDSync();
+          if (!sessionID) return 'No archived summary nodes yet.';
+
+          const session = this.readSessionSync(sessionID);
+          let roots = this.getSummaryRootsForSession(session);
+          if (roots.length === 0) return 'No archived summary nodes yet.';
+
+          if (query) {
+            const matches = this.findExpandMatches(sessionID, query);
+            roots = roots.filter((node) => this.nodeMatchesQuery(node, matches));
+            if (roots.length === 0) return `No archived summary nodes matched "${query}".`;
+          }
+
+          return [
+            `Session: ${sessionID}`,
+            query
+              ? `Archived summary roots matching "${query}": ${roots.length}`
+              : `Archived summary roots: ${roots.length}`,
+            'Use lcm_expand with one of these node IDs for more detail:',
+            ...roots.map(
+              (node) =>
+                `- ${node.nodeID} (messages ${node.startIndex + 1}-${node.endIndex + 1}, level ${node.level}): ${node.summaryText}`,
+            ),
+          ].join('\n');
+        }
+
+        const node = this.readSummaryNodeSync(input.nodeID);
+        if (!node) return 'Unknown summary node.';
+
+        const session = this.readSessionSync(node.sessionID);
+        if (!query)
+          return this.renderExpandedNode(
+            session,
+            node,
+            depth,
+            input.includeRaw ?? true,
+            messageLimit,
+          );
+
+        const matches = this.findExpandMatches(node.sessionID, query);
+        if (!this.nodeMatchesQuery(node, matches)) {
+          return `No descendants in ${node.nodeID} matched "${query}".`;
+        }
+
+        return this.renderTargetedExpansion(
+          session,
+          node,
+          depth,
+          input.includeRaw ?? true,
+          messageLimit,
+          query,
+          matches,
+        );
+      });
+    });
+  }
+
+  async buildCompactionContext(sessionID: string): Promise<string | undefined> {
+    return this.withStoreActivity(async () => {
+      await this.prepareForRead();
+      return this.withMutation(async () => {
+        const session = this.readSessionSync(sessionID);
+        if (session.messages.length === 0) return undefined;
+
+        const roots = this.getSummaryRootsForSession(session);
+        const note = this.buildResumeNote(session, roots);
+        this.getDb()
+          .prepare(
+            `INSERT INTO resumes (session_id, note, updated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(session_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`,
+          )
+          .run(sessionID, note, Date.now());
+        return note;
+      });
+    });
+  }
+
+  async transformMessages(messages: ConversationMessage[]): Promise<boolean> {
+    return this.withStoreActivity(async () => {
+      const validMessages = filterValidConversationMessages(messages, {
+        operation: 'transformMessages',
+      });
+      if (validMessages.length !== messages.length) {
+        messages.splice(0, messages.length, ...validMessages);
+      }
+      if (messages.length < this.options.minMessagesForTransform) {
+        const anchor = this.findAutomaticRetrievalAnchor(messages);
+        if (anchor) {
+          this.recordAutomaticRetrievalDebug(anchor.info.sessionID, {
+            sessionID: anchor.info.sessionID,
+            status: 'below-transform-threshold',
+            anchorMessageID: anchor.info.id,
+            anchorRole: anchor.info.role,
+            archivedCount: 0,
+            recentCount: messages.length,
+            queryTokens: [],
+            queries: [],
+            searchedScopes: [],
+            rawResultCount: 0,
+            hitCount: 0,
+            allowedHits: this.resolveAutomaticRetrievalAllowedHits(),
+            targetHits: 0,
+            stopReason: 'below-transform-threshold',
+            scopeStats: [],
+            hits: [],
+          });
+        }
+        return false;
+      }
+
+      const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
+      if (!window) {
+        const anchor = this.findAutomaticRetrievalAnchor(messages);
+        if (anchor) {
+          this.recordAutomaticRetrievalDebug(anchor.info.sessionID, {
+            sessionID: anchor.info.sessionID,
+            status: 'no-window',
+            anchorMessageID: anchor.info.id,
+            anchorRole: anchor.info.role,
+            archivedCount: 0,
+            recentCount: messages.length,
+            queryTokens: [],
+            queries: [],
+            searchedScopes: [],
+            rawResultCount: 0,
+            hitCount: 0,
+            allowedHits: this.resolveAutomaticRetrievalAllowedHits(),
+            targetHits: 0,
+            stopReason: 'no-window',
+            scopeStats: [],
+            hits: [],
+          });
+        }
+        return false;
+      }
+
+      await this.prepareForRead();
+
+      const { anchor, archived, recent } = window;
+
+      const roots = await this.withMutation(async () =>
+        this.ensureSummaryGraphSync(anchor.info.sessionID, archived),
+      );
+      if (roots.length === 0) {
+        this.recordAutomaticRetrievalDebug(anchor.info.sessionID, {
+          sessionID: anchor.info.sessionID,
+          status: 'no-summary-roots',
+          anchorMessageID: anchor.info.id,
+          anchorRole: anchor.info.role,
+          archivedCount: archived.length,
+          recentCount: recent.length,
+          queryTokens: [],
+          queries: [],
+          searchedScopes: [],
+          rawResultCount: 0,
+          hitCount: 0,
+          allowedHits: this.resolveAutomaticRetrievalAllowedHits(),
+          targetHits: 0,
+          stopReason: 'no-summary-roots',
+          scopeStats: [],
+          hits: [],
+        });
+        return false;
+      }
+
+      const summary = buildActiveSummaryText(
+        roots,
+        archived.length,
+        this.options.summaryCharBudget,
+      );
+      const retrieval = await this.buildAutomaticRetrievalContext(
+        anchor.info.sessionID,
+        recent,
+        anchor,
+      );
+      for (const message of archived) {
+        this.compactMessageInPlace(message);
+      }
+
+      anchor.parts = anchor.parts.filter(
+        (part) => !isSyntheticLcmTextPart(part, ['archive-summary', 'retrieved-context']),
+      );
+      const syntheticParts: Part[] = [];
+      if (retrieval) {
+        syntheticParts.push({
+          id: `lcm-memory-${randomUUID().replace(/-/g, '').slice(0, 12)}`,
+          sessionID: anchor.info.sessionID,
+          messageID: anchor.info.id,
+          type: 'text',
+          text: retrieval,
+          synthetic: true,
+          metadata: { opencodeLcm: 'retrieved-context' },
+        });
+      }
+      syntheticParts.push({
+        id: `lcm-summary-${randomUUID().replace(/-/g, '').slice(0, 12)}`,
+        sessionID: anchor.info.sessionID,
+        messageID: anchor.info.id,
+        type: 'text',
+        text: summary,
+        synthetic: true,
+        metadata: { opencodeLcm: 'archive-summary' },
+      });
+      anchor.parts.push(...syntheticParts);
+      return true;
+    });
+  }
+
+  systemHint(): string | undefined {
+    if (!this.options.systemHint) return undefined;
+
+    return [
+      'Archived session state may exist outside the active prompt.',
+      'opencode-lcm may automatically recall archived context when it looks relevant to the current turn.',
+      'Use lcm_describe, lcm_grep, lcm_resume, lcm_expand, or lcm_artifact only when deeper archive inspection is still needed.',
+      'Keep ctx_* usage selective and treat those calls as infrastructure, not task intent.',
+    ].join(' ');
+  }
+
+  private sanitizeSessionMessages(
+    session: NormalizedSession,
+    operation: string,
+  ): NormalizedSession {
+    const messages = filterValidConversationMessages(session.messages, {
+      operation,
+      sessionID: session.sessionID,
+    });
+    return messages.length === session.messages.length ? session : { ...session, messages };
+  }
+
+  private shouldSkipMalformedCapturedEvent(event: CapturedEvent): boolean {
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case 'message.updated': {
+        if (getValidMessageInfo(payload.properties.info)) return false;
+        logMalformedMessage('Skipping malformed message.updated event', {
+          operation: 'capture',
+          sessionID: event.sessionID,
+          eventType: payload.type,
+        });
+        return true;
+      }
+      case 'message.part.updated': {
+        if (isValidMessagePartUpdate(payload)) return false;
+        logMalformedMessage('Skipping malformed message.part.updated event', {
+          operation: 'capture',
+          sessionID: event.sessionID,
+          eventType: payload.type,
+        });
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  private async buildAutomaticRetrievalContext(
+    sessionID: string,
+    recent: ConversationMessage[],
+    anchor: ConversationMessage,
+  ): Promise<string | undefined> {
+    if (!this.options.automaticRetrieval.enabled) {
+      this.recordAutomaticRetrievalDebug(sessionID, {
+        sessionID,
+        status: 'disabled',
+        anchorMessageID: anchor.info.id,
+        anchorRole: anchor.info.role,
+        archivedCount: 0,
+        recentCount: recent.length,
+        queryTokens: [],
+        queries: [],
+        searchedScopes: [],
+        rawResultCount: 0,
+        hitCount: 0,
+        allowedHits: 0,
+        targetHits: 0,
+        stopReason: 'disabled',
+        scopeStats: [],
+        hits: [],
+      });
+      return undefined;
+    }
+
+    const query = this.buildAutomaticRetrievalQuery(anchor, recent);
+    if (!query) {
+      this.recordAutomaticRetrievalDebug(sessionID, {
+        sessionID,
+        status: 'no-query',
+        anchorMessageID: anchor.info.id,
+        anchorRole: anchor.info.role,
+        archivedCount: 0,
+        recentCount: recent.length,
+        queryTokens: [],
+        queries: [],
+        searchedScopes: [],
+        rawResultCount: 0,
+        hitCount: 0,
+        allowedHits: this.resolveAutomaticRetrievalAllowedHits(),
+        targetHits: 0,
+        stopReason: 'no-query',
+        scopeStats: [],
+        hits: [],
+      });
+      return undefined;
+    }
+
+    const allowedHits =
+      clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4) +
+      clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3) +
+      clamp(this.options.automaticRetrieval.maxArtifactHits, 0, 3);
+    if (allowedHits <= 0) {
+      this.recordAutomaticRetrievalDebug(sessionID, {
+        sessionID,
+        status: 'no-hit-quota',
+        anchorMessageID: anchor.info.id,
+        anchorRole: anchor.info.role,
+        archivedCount: 0,
+        recentCount: recent.length,
+        queryTokens: query.tokens,
+        queries: query.queries,
+        searchedScopes: [],
+        rawResultCount: 0,
+        hitCount: 0,
+        allowedHits,
+        targetHits: 0,
+        stopReason: 'no-hit-quota',
+        scopeStats: [],
+        hits: [],
+      });
+      return undefined;
+    }
+
+    const targetHits = this.resolveAutomaticRetrievalTargetHits(allowedHits);
+    const results: SearchResult[] = [];
+    const seenResults = new Set<string>();
+    const searchedScopes: ScopeName[] = [];
+    const scopeStats: Array<{
+      scope: string;
+      budget: number;
+      rawResults: number;
+      selectedHits: number;
+    }> = [];
+    let stopReason = 'scope-order-exhausted';
+    let hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+
+    for (const scope of this.buildAutomaticRetrievalScopeOrder(sessionID)) {
+      const budget = this.resolveAutomaticRetrievalScopeBudget(scope);
+      if (budget <= 0) {
+        scopeStats.push({ scope, budget, rawResults: 0, selectedHits: 0 });
+        continue;
+      }
+
+      searchedScopes.push(scope);
+      let scopeRawResults = 0;
+      let scopeSelectedHits = 0;
+
+      for (const candidateQuery of query.queries) {
+        const remainingBudget = budget - scopeRawResults;
+        if (remainingBudget <= 0) break;
+
+        const previousHits = hits;
+        const scopedResults = await this.grep({
+          query: candidateQuery,
+          sessionID,
+          scope,
+          limit: remainingBudget,
+        });
+
+        for (const result of scopedResults) {
+          const key = `${result.type}:${result.id}`;
+          if (seenResults.has(key)) continue;
+          seenResults.add(key);
+          results.push(result);
+          scopeRawResults += 1;
+        }
+
+        hits = this.selectAutomaticRetrievalHits(sessionID, recent, query.tokens, results);
+        scopeSelectedHits += this.countNewAutomaticRetrievalHits(previousHits, hits);
+
+        if (hits.length >= allowedHits) {
+          stopReason = 'hit-quota-reached';
+          break;
+        }
+
+        if (hits.length >= targetHits) {
+          stopReason = 'target-hits-reached';
+          break;
+        }
+      }
+
+      scopeStats.push({
+        scope,
+        budget,
+        rawResults: scopeRawResults,
+        selectedHits: scopeSelectedHits,
+      });
+
+      if (
+        hits.length > 0 &&
+        this.options.automaticRetrieval.stop.stopOnFirstScopeWithHits &&
+        scopeSelectedHits > 0
+      ) {
+        stopReason = 'first-scope-hit';
+      }
+
+      if (stopReason !== 'scope-order-exhausted') {
+        this.recordAutomaticRetrievalDebug(sessionID, {
+          sessionID,
+          status: 'recalled',
+          anchorMessageID: anchor.info.id,
+          anchorRole: anchor.info.role,
+          archivedCount: Math.max(0, this.readMessageCountSync(sessionID) - recent.length),
+          recentCount: recent.length,
+          queryTokens: query.tokens,
+          queries: query.queries,
+          searchedScopes,
+          rawResultCount: results.length,
+          hitCount: hits.length,
+          allowedHits,
+          targetHits,
+          stopReason,
+          scopeStats,
+          hits,
+        });
+        return renderAutomaticRetrievalContext(
+          searchedScopes,
+          hits,
+          clamp(this.options.automaticRetrieval.maxChars, 240, 4000),
+          {
+            queries: query.queries,
+            rawResults: results.length,
+            stopReason,
+            scopeStats,
+          },
+        );
+      }
+    }
+
+    if (hits.length === 0) {
+      this.recordAutomaticRetrievalDebug(sessionID, {
+        sessionID,
+        status: 'no-hits',
+        anchorMessageID: anchor.info.id,
+        anchorRole: anchor.info.role,
+        archivedCount: Math.max(0, this.readMessageCountSync(sessionID) - recent.length),
+        recentCount: recent.length,
+        queryTokens: query.tokens,
+        queries: query.queries,
+        searchedScopes,
+        rawResultCount: results.length,
+        hitCount: 0,
+        allowedHits,
+        targetHits,
+        stopReason,
+        scopeStats,
+        hits: [],
+      });
+      return undefined;
+    }
+
+    this.recordAutomaticRetrievalDebug(sessionID, {
+      sessionID,
+      status: 'recalled',
+      anchorMessageID: anchor.info.id,
+      anchorRole: anchor.info.role,
+      archivedCount: Math.max(0, this.readMessageCountSync(sessionID) - recent.length),
+      recentCount: recent.length,
+      queryTokens: query.tokens,
+      queries: query.queries,
+      searchedScopes,
+      rawResultCount: results.length,
+      hitCount: hits.length,
+      allowedHits,
+      targetHits,
+      stopReason,
+      scopeStats,
+      hits,
+    });
+
+    return renderAutomaticRetrievalContext(
+      searchedScopes,
+      hits,
+      clamp(this.options.automaticRetrieval.maxChars, 240, 4000),
+      {
+        queries: query.queries,
+        rawResults: results.length,
+        stopReason,
+        scopeStats,
+      },
+    );
+  }
+
+  private resolveAutomaticRetrievalAllowedHits(): number {
+    return (
+      clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4) +
+      clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3) +
+      clamp(this.options.automaticRetrieval.maxArtifactHits, 0, 3)
+    );
+  }
+
+  private findAutomaticRetrievalAnchor(
+    messages: ConversationMessage[],
+  ): ConversationMessage | undefined {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (messages[index]?.info.role === 'user') return messages[index];
+    }
+    return undefined;
+  }
+
+  private recordAutomaticRetrievalDebug(
+    sessionID: string,
+    debug: AutomaticRetrievalDebugInfo,
+  ): void {
+    this.lastAutomaticRetrievalBySession.set(sessionID, debug);
+  }
+
+  private buildAutomaticRetrievalQuery(
+    anchor: ConversationMessage,
+    recent: ConversationMessage[],
+  ): { queries: string[]; tokens: string[] } | undefined {
+    const minTokens = clamp(
+      this.options.automaticRetrieval.minTokens,
+      1,
+      AUTOMATIC_RETRIEVAL_QUERY_TOKENS,
+    );
+    const tokens: string[] = [];
+    const anchorText = sanitizeAutomaticRetrievalSourceText(
+      guessMessageText(anchor, this.options.interop.ignoreToolPrefixes),
+    );
+    const anchorFiles = listFiles(anchor);
+    const pushTokens = (value?: string) => {
+      if (!value || tokens.length >= AUTOMATIC_RETRIEVAL_QUERY_TOKENS) return;
+      const sanitized = sanitizeAutomaticRetrievalSourceText(value);
+      if (!sanitized) return;
+      for (const token of filterIntentTokens(tokenizeQuery(sanitized))) {
+        if (tokens.includes(token)) continue;
+        tokens.push(token);
+        if (tokens.length >= AUTOMATIC_RETRIEVAL_QUERY_TOKENS) break;
+      }
+    };
+
+    pushTokens(anchorText);
+    for (const file of anchorFiles) pushTokens(path.basename(file));
+    const anchorSignalCount = tokens.length;
+    if (anchorSignalCount === 0) return undefined;
+    if (
+      shouldSuppressLowSignalAutomaticRetrievalAnchor(
+        anchorText,
+        anchorSignalCount,
+        minTokens,
+        anchorFiles.length,
+      )
+    ) {
+      return undefined;
+    }
+
+    for (const message of recent.slice(-AUTOMATIC_RETRIEVAL_RECENT_MESSAGES)) {
+      for (const file of listFiles(message)) pushTokens(path.basename(file));
+    }
+
+    const recentUsers = recent
+      .filter((message) => message.info.role === 'user' && message.info.id !== anchor.info.id)
+      .slice(-AUTOMATIC_RETRIEVAL_RECENT_MESSAGES)
+      .reverse();
+    for (const message of recentUsers) {
+      if (tokens.length >= minTokens) break;
+      pushTokens(guessMessageText(message, this.options.interop.ignoreToolPrefixes));
+    }
+
+    if (tokens.length < minTokens) return undefined;
+    const queryTokens = tokens.slice(0, 5);
+
+    // Apply TF-IDF weighting to filter corpus-common noise tokens
+    const weightedTokens = filterTokensByTfidf(this.getDb(), queryTokens, {
+      minTokens,
+    });
+
+    return {
+      queries: this.buildAutomaticRetrievalQueries(weightedTokens, minTokens),
+      tokens: weightedTokens,
+    };
+  }
+
+  private buildAutomaticRetrievalQueries(tokens: string[], minTokens: number): string[] {
+    const queries: string[] = [];
+    const pushQuery = (parts: string[]) => {
+      const normalized = parts.filter(Boolean);
+      if (normalized.length < minTokens) return;
+      const value = normalized.join(' ');
+      if (!queries.includes(value)) queries.push(value);
+    };
+
+    // Full token set (descending window from front)
+    for (let size = Math.min(tokens.length, 4); size >= minTokens; size -= 1) {
+      pushQuery(tokens.slice(0, size));
+      if (queries.length >= AUTOMATIC_RETRIEVAL_QUERY_VARIANTS) return queries;
+    }
+
+    // Sliding windows starting later in the token list
+    for (let size = Math.min(tokens.length, 4); size >= Math.max(2, minTokens); size -= 1) {
+      for (let start = 1; start + size <= tokens.length; start += 1) {
+        pushQuery(tokens.slice(start, start + size));
+        if (queries.length >= AUTOMATIC_RETRIEVAL_QUERY_VARIANTS) return queries;
+      }
+    }
+
+    // Adjacent bigram phrases — FTS NEAR/phrase queries rank adjacency higher
+    if (tokens.length >= 2) {
+      for (let i = 0; i < tokens.length - 1; i += 1) {
+        const phrase = `"${tokens[i]} ${tokens[i + 1]}"`;
+        if (!queries.includes(phrase)) queries.push(phrase);
+        if (queries.length >= AUTOMATIC_RETRIEVAL_QUERY_VARIANTS) return queries;
+      }
+    }
+
+    // Skip-gram triples for longer token lists
+    if (tokens.length >= 5) {
+      pushQuery([tokens[0], tokens[1], tokens[4]]);
+      pushQuery([tokens[0], tokens[2], tokens[4]]);
+    }
+
+    return queries.slice(0, AUTOMATIC_RETRIEVAL_QUERY_VARIANTS);
+  }
+
+  private buildAutomaticRetrievalScopeOrder(sessionID: string): ScopeName[] {
+    const configured = this.resolveConfiguredScope('grep', undefined, sessionID);
+    const candidates = [...this.options.automaticRetrieval.scopeOrder];
+    if (configured === 'all' && !candidates.includes('all')) {
+      candidates.push('all');
+    }
+
+    const ordered: ScopeName[] = [];
+    const seenScopes = new Set<string>();
+
+    for (const scope of candidates) {
+      const sessionIDs = this.resolveScopeSessionIDs(scope, sessionID);
+      const key = sessionIDs ? [...sessionIDs].sort().join(',') : 'all';
+      if (seenScopes.has(key)) continue;
+      seenScopes.add(key);
+      ordered.push(scope);
+    }
+
+    return ordered;
+  }
+
+  private resolveAutomaticRetrievalScopeBudget(scope: ScopeName): number {
+    return clamp(this.options.automaticRetrieval.scopeBudgets[scope], 0, 24);
+  }
+
+  private resolveAutomaticRetrievalTargetHits(allowedHits: number): number {
+    return clamp(this.options.automaticRetrieval.stop.targetHits, 1, allowedHits);
+  }
+
+  private countNewAutomaticRetrievalHits(
+    before: Array<{ kind: string; id: string }>,
+    after: Array<{ kind: string; id: string }>,
+  ): number {
+    const seen = new Set(before.map((hit) => `${hit.kind}:${hit.id}`));
+    return after.filter((hit) => !seen.has(`${hit.kind}:${hit.id}`)).length;
+  }
+
+  private selectAutomaticRetrievalHits(
+    sessionID: string,
+    recent: ConversationMessage[],
+    tokens: string[],
+    results: SearchResult[],
+  ) {
+    const filteredResults = results.filter(
+      (result) => !this.isAutomaticRetrievalNoiseResult(result),
+    );
+    return selectAutomaticRetrievalHits({
+      recent,
+      tokens,
+      results: filteredResults,
+      quotas: {
+        message: clamp(this.options.automaticRetrieval.maxMessageHits, 0, 4),
+        summary: clamp(this.options.automaticRetrieval.maxSummaryHits, 0, 3),
+        artifact: clamp(this.options.automaticRetrieval.maxArtifactHits, 0, 3),
+      },
+      isFreshResult: (result, freshMessageIDs) =>
+        this.isFreshAutomaticRetrievalResult(sessionID, freshMessageIDs, result),
+    });
+  }
+
+  private isAutomaticRetrievalNoiseResult(result: SearchResult): boolean {
+    return isAutomaticRetrievalNoise(result.snippet);
+  }
+
+  private isFreshAutomaticRetrievalResult(
+    sessionID: string,
+    freshMessageIDs: Set<string>,
+    result: SearchResult,
+  ): boolean {
+    if (result.sessionID !== sessionID) return false;
+    if (result.type === 'summary') return false;
+    if (result.type.startsWith('artifact:')) {
+      const artifact = this.readArtifactSync(result.id);
+      return artifact ? freshMessageIDs.has(artifact.messageID) : false;
+    }
+    return freshMessageIDs.has(result.id);
+  }
+
+  private buildResumeNote(session: NormalizedSession, roots: SummaryNodeData[]): string {
+    const files = [...new Set(session.messages.flatMap(listFiles))].slice(0, 10);
+    const recent = session.messages
+      .slice(-4)
+      .map(
+        (message) =>
+          `- ${message.info.role}: ${truncate(guessMessageText(message, this.options.interop.ignoreToolPrefixes), 160)}`,
+      )
+      .filter((line) => !line.endsWith(': '));
+
+    return truncate(
+      [
+        'LCM prototype resume note',
+        `Session: ${session.sessionID}`,
+        `Title: ${makeSessionTitle(session) ?? 'Unknown'}`,
+        `Root session: ${session.rootSessionID ?? session.sessionID}`,
+        `Parent session: ${session.parentSessionID ?? 'none'}`,
+        `Lineage depth: ${session.lineageDepth ?? 0}`,
+        `Archived messages: ${Math.max(0, session.messages.length - this.options.freshTailMessages)}`,
+        ...(roots.length > 0
+          ? [
+              'Summary roots:',
+              ...roots
+                .slice(0, 4)
+                .map((node) => `- ${node.nodeID}: ${truncate(node.summaryText, 160)}`),
+            ]
+          : []),
+        ...(files.length > 0 ? [`Files touched: ${files.join(', ')}`] : []),
+        ...(recent.length > 0 ? ['Recent archived activity:', ...recent] : []),
+        'Keep context-mode in charge of routing and sandbox tools.',
+        'Use lcm_describe, lcm_grep, lcm_resume, lcm_expand, or lcm_artifact for archived details.',
+      ].join('\n'),
+      this.options.compactContextLimit,
+    );
+  }
+
+  private compactMessageInPlace(message: ConversationMessage): void {
+    for (const part of message.parts) {
+      switch (part.type) {
+        case 'text':
+          if (part.metadata?.opencodeLcm === 'archive-summary') break;
+          part.text = archivePlaceholder('older text elided');
+          break;
+        case 'reasoning':
+          part.text = archivePlaceholder('reasoning omitted');
+          break;
+        case 'tool': {
+          if (part.state.status === 'completed') {
+            const label = this.shouldIgnoreTool(part.tool)
+              ? 'infrastructure tool output omitted'
+              : `tool output for ${part.tool} omitted`;
+            part.state.output = archivePlaceholder(label);
+            part.state.attachments = undefined;
+          }
+          if (part.state.status === 'error') {
+            part.state.error = archivePlaceholder(`error output for ${part.tool} omitted`);
+          }
+          break;
+        }
+        case 'file':
+          if (part.source?.text) {
+            part.source.text.value = archivePlaceholder(
+              part.source.path ?? part.filename ?? 'file contents omitted',
+            );
+            part.source.text.start = 0;
+            part.source.text.end = part.source.text.value.length;
+          }
+          break;
+        case 'snapshot':
+          part.snapshot = archivePlaceholder('snapshot omitted');
+          break;
+        case 'agent':
+          if (part.source) {
+            part.source.value = archivePlaceholder(`agent source for ${part.name} omitted`);
+            part.source.start = 0;
+            part.source.end = part.source.value.length;
+          }
+          break;
+        case 'patch':
+          part.files = part.files.slice(0, 8);
+          break;
+        case 'subtask':
+          part.prompt = truncate(part.prompt, this.options.partCharBudget);
+          part.description = truncate(part.description, this.options.partCharBudget);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+
+  private shouldIgnoreTool(toolName: string): boolean {
+    return this.options.interop.ignoreToolPrefixes.some((prefix) => toolName.startsWith(prefix));
+  }
+
+  private summarizeMessages(
+    messages: ConversationMessage[],
+    limit = SUMMARY_NODE_CHAR_LIMIT,
+  ): string {
+    const strategy = this.options.summaryV2?.strategy ?? 'deterministic-v1';
+    return strategy === 'deterministic-v2'
+      ? this.summarizeMessagesDeterministicV2(messages, limit)
+      : this.summarizeMessagesDeterministicV1(messages, limit);
+  }
+
+  private summarizeMessagesDeterministicV1(
+    messages: ConversationMessage[],
+    limit = SUMMARY_NODE_CHAR_LIMIT,
+  ): string {
+    const goals = messages
+      .filter((message) => message.info.role === 'user')
+      .map((message) => guessMessageText(message, this.options.interop.ignoreToolPrefixes))
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((text) => truncate(text, 90));
+
+    const work = messages
+      .filter((message) => message.info.role === 'assistant')
+      .map((message) => guessMessageText(message, this.options.interop.ignoreToolPrefixes))
+      .filter(Boolean)
+      .slice(-2)
+      .map((text) => truncate(text, 90));
+
+    const files = [...new Set(messages.flatMap(listFiles))].slice(0, 4);
+    const tools = [...new Set(this.listTools(messages))].slice(0, 4);
+
+    const segments = [
+      goals.length > 0 ? `Goals: ${goals.join(' | ')}` : '',
+      work.length > 0 ? `Work: ${work.join(' | ')}` : '',
+      files.length > 0 ? `Files: ${files.join(', ')}` : '',
+      tools.length > 0 ? `Tools: ${tools.join(', ')}` : '',
+    ].filter(Boolean);
+
+    if (segments.length === 0) return truncate(`Archived messages ${messages.length}`, limit);
+    return truncate(segments.join(' || '), limit);
+  }
+
+  private summarizeMessagesDeterministicV2(
+    messages: ConversationMessage[],
+    limit = SUMMARY_NODE_CHAR_LIMIT,
+  ): string {
+    const perMsgBudget = this.options.summaryV2?.perMessageBudget ?? 110;
+    const ignoreToolPrefixes = this.options.interop.ignoreToolPrefixes;
+    const userTexts = messages
+      .filter((message) => message.info.role === 'user')
+      .map((message) => guessMessageText(message, ignoreToolPrefixes))
+      .filter(Boolean);
+    const assistantTexts = messages
+      .filter((message) => message.info.role === 'assistant')
+      .map((message) => guessMessageText(message, ignoreToolPrefixes))
+      .filter(Boolean);
+    const allFiles = [...new Set(messages.flatMap(listFiles))];
+    const allTools = [...new Set(this.listTools(messages))];
+    const hasErrors = messages.some((message) =>
+      message.parts.some(
+        (part) =>
+          (part.type === 'tool' && 'state' in part && part.state?.status === 'error') ||
+          (part.type === 'text' &&
+            /\b(?:error|exception|fail(?:ed|ure)?)\b/i.test(part.text ?? '')),
+      ),
+    );
+
+    const segments: string[] = [];
+    if (userTexts.length > 0) {
+      const first = truncate(userTexts[0], perMsgBudget);
+      if (userTexts.length > 1) {
+        const last = truncate(userTexts[userTexts.length - 1], perMsgBudget);
+        segments.push(`Goals: ${first} → ${last}`);
+      } else {
+        segments.push(`Goals: ${first}`);
+      }
+    }
+
+    if (assistantTexts.length > 0) {
+      const recent = assistantTexts
+        .slice(-2)
+        .map((text) => truncate(text, perMsgBudget))
+        .join(' | ');
+      segments.push(`Work: ${recent}`);
+    }
+
+    if (allFiles.length > 0) {
+      const shown = allFiles.slice(0, 6).join(', ');
+      segments.push(
+        allFiles.length > 6 ? `Files[${allFiles.length}]: ${shown}` : `Files: ${shown}`,
+      );
+    }
+
+    if (allTools.length > 0) {
+      const shown = allTools.slice(0, 6).join(', ');
+      segments.push(
+        allTools.length > 6 ? `Tools[${allTools.length}]: ${shown}` : `Tools: ${shown}`,
+      );
+    }
+
+    if (hasErrors) segments.push('⚠err');
+    segments.push(`${messages.length}msg(u:${userTexts.length}/a:${assistantTexts.length})`);
+
+    if (segments.length === 0) return truncate(`Archived ${messages.length} messages`, limit);
+    return truncate(segments.join(' || '), limit);
+  }
+
+  private listTools(messages: ConversationMessage[]): string[] {
+    const tools: string[] = [];
+    for (const message of messages) {
+      for (const part of message.parts) {
+        if (part.type !== 'tool') continue;
+        if (this.shouldIgnoreTool(part.tool)) continue;
+        tools.push(part.tool);
+      }
+    }
+    return tools;
+  }
+
+  private buildArchivedSignature(messages: ConversationMessage[]): string {
+    const hash = createHash('sha256');
+    for (const message of messages) {
+      hash.update(signatureString(message.info?.id, 'unknown-message'));
+      hash.update(signatureString(message.info?.role, 'unknown-role'));
+      hash.update(String(messageCreatedAt(message)));
+      hash.update(String(guessMessageText(message, this.options.interop.ignoreToolPrefixes) ?? ''));
+      hash.update(JSON.stringify(listFiles(message)));
+      hash.update(JSON.stringify(this.listTools([message])));
+      hash.update(String(messageParts(message).length));
+    }
+    return hash.digest('hex');
+  }
+
+  private getArchivedMessages(messages: ConversationMessage[]): ConversationMessage[] {
+    const window = resolveArchiveTransformWindow(messages, this.options.freshTailMessages);
+    if (window) return window.archived;
+
+    const archivedCount = Math.max(0, messages.length - this.options.freshTailMessages);
+    return messages.slice(0, archivedCount);
+  }
+
+  private getSummaryRootsForSession(session: NormalizedSession): SummaryNodeData[] {
+    const archived = this.getArchivedMessages(session.messages);
+    return this.ensureSummaryGraphSync(session.sessionID, archived);
+  }
+
+  private ensureSummaryGraphSync(
+    sessionID: string,
+    archivedMessages: ConversationMessage[],
+  ): SummaryNodeData[] {
+    if (archivedMessages.length === 0) {
+      this.clearSummaryGraphSync(sessionID);
+      return [];
+    }
+
+    const latestMessageCreated = messageCreatedAt(archivedMessages.at(-1));
+    const archivedSignature = this.buildArchivedSignature(archivedMessages);
+    const state = safeQueryOne<SummaryStateRow>(
+      this.getDb().prepare('SELECT * FROM summary_state WHERE session_id = ?'),
+      [sessionID],
+      'ensureSummaryGraphSync',
+    );
+
+    if (
+      state &&
+      state.archived_count === archivedMessages.length &&
+      state.latest_message_created === latestMessageCreated &&
+      state.archived_signature === archivedSignature
+    ) {
+      const rootIDs = parseJson<string[]>(state.root_node_ids_json);
+      const roots = rootIDs
+        .map((nodeID) => this.readSummaryNodeSync(nodeID))
+        .filter((node): node is SummaryNodeData => Boolean(node));
+      if (
+        rootIDs.length > 0 &&
+        roots.length === rootIDs.length &&
+        this.canReuseSummaryGraphSync(sessionID, archivedMessages, roots)
+      ) {
+        return roots;
+      }
+    }
+
+    return this.rebuildSummaryGraphSync(sessionID, archivedMessages, archivedSignature);
+  }
+
+  private canReuseSummaryGraphSync(
+    sessionID: string,
+    archivedMessages: ConversationMessage[],
+    roots: SummaryNodeData[],
+  ): boolean {
+    if (roots.length === 0) return false;
+
+    const expectedMessageIDs = archivedMessages.map((message) => message.info.id);
+    const seen = new Set<string>();
+
+    const validateNode = (node: SummaryNodeData, expectedSlot: number): boolean => {
+      if (node.sessionID !== sessionID) return false;
+      if (node.nodeID !== buildSummaryNodeID(sessionID, node.level, expectedSlot)) return false;
+      if (seen.has(node.nodeID)) return false;
+      seen.add(node.nodeID);
+
+      if (
+        node.startIndex < 0 ||
+        node.endIndex < node.startIndex ||
+        node.endIndex >= expectedMessageIDs.length
+      ) {
+        return false;
+      }
+
+      const expectedNodeMessageIDs = expectedMessageIDs.slice(node.startIndex, node.endIndex + 1);
+      if (node.messageIDs.length !== expectedNodeMessageIDs.length) return false;
+      for (let index = 0; index < expectedNodeMessageIDs.length; index += 1) {
+        if (node.messageIDs[index] !== expectedNodeMessageIDs[index]) return false;
+      }
+
+      const expectedSummaryText = this.summarizeMessages(
+        archivedMessages.slice(node.startIndex, node.endIndex + 1),
+      );
+      if (node.summaryText !== expectedSummaryText) return false;
+      if (node.strategy !== (this.options.summaryV2?.strategy ?? 'deterministic-v1')) return false;
+
+      const children = this.readSummaryChildrenSync(node.nodeID);
+      if (node.nodeKind === 'leaf') {
+        return (
+          children.length === 0 && node.endIndex - node.startIndex + 1 <= SUMMARY_LEAF_MESSAGES
+        );
+      }
+      if (children.length === 0 || children.length > SUMMARY_BRANCH_FACTOR) return false;
+      if (children[0]?.startIndex !== node.startIndex) return false;
+      if (children.at(-1)?.endIndex !== node.endIndex) return false;
+
+      let nextStartIndex = node.startIndex;
+      for (const [childPosition, child] of children.entries()) {
+        if (child.level !== node.level - 1) return false;
+        if (child.startIndex !== nextStartIndex) return false;
+        if (!validateNode(child, expectedSlot * SUMMARY_BRANCH_FACTOR + childPosition))
+          return false;
+        nextStartIndex = child.endIndex + 1;
+      }
+
+      return nextStartIndex === node.endIndex + 1;
+    };
+
+    let nextStartIndex = 0;
+    for (const [rootSlot, root] of roots.entries()) {
+      if (root.startIndex !== nextStartIndex) return false;
+      if (!validateNode(root, rootSlot)) return false;
+      nextStartIndex = root.endIndex + 1;
+    }
+
+    return nextStartIndex === expectedMessageIDs.length;
+  }
+
+  private rebuildSummaryGraphSync(
+    sessionID: string,
+    archivedMessages: ConversationMessage[],
+    archivedSignature: string,
+  ): SummaryNodeData[] {
+    const now = Date.now();
+    const summaryStrategy = this.options.summaryV2?.strategy ?? 'deterministic-v1';
+    let level = 0;
+    const nodes: SummaryNodeData[] = [];
+    const edges: Array<{
+      sessionID: string;
+      parentID: string;
+      childID: string;
+      childPosition: number;
+    }> = [];
+
+    const makeNode = (input: {
+      nodeKind: 'leaf' | 'internal';
+      startIndex: number;
+      endIndex: number;
+      messageIDs: string[];
+      summaryText: string;
+      level: number;
+      slot: number;
+    }): SummaryNodeData => ({
+      nodeID: buildSummaryNodeID(sessionID, input.level, input.slot),
+      sessionID,
+      level: input.level,
+      nodeKind: input.nodeKind,
+      startIndex: input.startIndex,
+      endIndex: input.endIndex,
+      messageIDs: input.messageIDs,
+      summaryText: input.summaryText,
+      strategy: summaryStrategy,
+      createdAt: now,
+    });
+
+    let currentLevel: SummaryNodeData[] = [];
+    for (
+      let start = 0, slot = 0;
+      start < archivedMessages.length;
+      start += SUMMARY_LEAF_MESSAGES, slot += 1
+    ) {
+      const chunk = archivedMessages.slice(start, start + SUMMARY_LEAF_MESSAGES);
+      const node = makeNode({
+        nodeKind: 'leaf',
+        startIndex: start,
+        endIndex: start + chunk.length - 1,
+        messageIDs: chunk.map((message) => message.info.id),
+        summaryText: this.summarizeMessages(chunk),
+        level,
+        slot,
+      });
+      nodes.push(node);
+      currentLevel.push(node);
+    }
+
+    while (currentLevel.length > 1) {
+      level += 1;
+      const nextLevel: SummaryNodeData[] = [];
+
+      for (let index = 0; index < currentLevel.length; index += SUMMARY_BRANCH_FACTOR) {
+        const children = currentLevel.slice(index, index + SUMMARY_BRANCH_FACTOR);
+        const startIndex = children[0].startIndex;
+        const endIndex = children.at(-1)?.endIndex ?? startIndex;
+        const covered = archivedMessages.slice(startIndex, endIndex + 1);
+        const node = makeNode({
+          nodeKind: 'internal',
+          startIndex,
+          endIndex,
+          messageIDs: covered.map((message) => message.info.id),
+          summaryText: this.summarizeMessages(covered),
+          level,
+          slot: nextLevel.length,
+        });
+        nodes.push(node);
+        nextLevel.push(node);
+        children.forEach((child, childPosition) => {
+          edges.push({
+            sessionID,
+            parentID: node.nodeID,
+            childID: child.nodeID,
+            childPosition,
+          });
+        });
+      }
+
+      currentLevel = nextLevel;
+    }
+
+    const roots = currentLevel;
+    const db = this.getDb();
+    withTransaction(db, 'rebuildSummaryGraph', () => {
+      this.clearSummaryGraphSync(sessionID);
+
+      const insertNode = db.prepare(
+        `INSERT INTO summary_nodes
+         (node_id, session_id, level, node_kind, start_index, end_index, message_ids_json, summary_text, strategy, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      const insertEdge = db.prepare(
+        `INSERT INTO summary_edges (session_id, parent_id, child_id, child_position)
+         VALUES (?, ?, ?, ?)`,
+      );
+      const insertSummaryFts = db.prepare(
+        'INSERT INTO summary_fts (session_id, node_id, level, created_at, content) VALUES (?, ?, ?, ?, ?)',
+      );
+
+      for (const node of nodes) {
+        insertNode.run(
+          node.nodeID,
+          node.sessionID,
+          node.level,
+          node.nodeKind,
+          node.startIndex,
+          node.endIndex,
+          JSON.stringify(node.messageIDs),
+          node.summaryText,
+          node.strategy,
+          node.createdAt,
+        );
+        insertSummaryFts.run(
+          node.sessionID,
+          node.nodeID,
+          String(node.level),
+          String(node.createdAt),
+          node.summaryText,
+        );
+      }
+
+      for (const edge of edges) {
+        insertEdge.run(edge.sessionID, edge.parentID, edge.childID, edge.childPosition);
+      }
+
+      db.prepare(
+        `INSERT INTO summary_state (session_id, archived_count, latest_message_created, archived_signature, root_node_ids_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+            archived_count = excluded.archived_count,
+            latest_message_created = excluded.latest_message_created,
+            archived_signature = excluded.archived_signature,
+            root_node_ids_json = excluded.root_node_ids_json,
+            updated_at = excluded.updated_at`,
+      ).run(
+        sessionID,
+        archivedMessages.length,
+        messageCreatedAt(archivedMessages.at(-1)),
+        archivedSignature,
+        JSON.stringify(roots.map((node) => node.nodeID)),
+        now,
+      );
+    });
+
+    return roots;
+  }
+
+  private readSummaryNodeSync(nodeID: string): SummaryNodeData | undefined {
+    const row = safeQueryOne<SummaryNodeRow>(
+      this.getDb().prepare('SELECT * FROM summary_nodes WHERE node_id = ?'),
+      [nodeID],
+      'readSummaryNodeSync',
+    );
+    if (!row) return undefined;
+
+    return {
+      nodeID: row.node_id,
+      sessionID: row.session_id,
+      level: row.level,
+      nodeKind: row.node_kind === 'leaf' ? 'leaf' : 'internal',
+      startIndex: row.start_index,
+      endIndex: row.end_index,
+      messageIDs: parseJson<string[]>(row.message_ids_json),
+      summaryText: row.summary_text,
+      strategy: row.strategy,
+      createdAt: row.created_at,
+    };
+  }
+
+  private readSummaryChildrenSync(nodeID: string): SummaryNodeData[] {
+    const rows = this.getDb()
+      .prepare(
+        `SELECT e.parent_id, e.child_id, e.child_position
+         FROM summary_edges e
+         WHERE e.parent_id = ?
+         ORDER BY e.child_position ASC`,
+      )
+      .all(nodeID) as SummaryEdgeRow[];
+
+    return rows
+      .map((row) => this.readSummaryNodeSync(row.child_id))
+      .filter((node): node is SummaryNodeData => Boolean(node));
+  }
+
+  private readArtifactBlobSync(contentHash?: string | null): ArtifactBlobRow | undefined {
+    if (!contentHash) return undefined;
+    return safeQueryOne<ArtifactBlobRow>(
+      this.getDb().prepare('SELECT * FROM artifact_blobs WHERE content_hash = ?'),
+      [contentHash],
+      'readArtifactBlobSync',
+    );
+  }
+
+  private materializeArtifactRow(row: ArtifactRow): ArtifactData {
+    return materializeArtifactRowModule(this.artifactDeps(), row);
+  }
+
+  private readArtifactSync(artifactID: string): ArtifactData | undefined {
+    const row = safeQueryOne<ArtifactRow>(
+      this.getDb().prepare('SELECT * FROM artifacts WHERE artifact_id = ?'),
+      [artifactID],
+      'readArtifactSync',
+    );
+    if (!row) return undefined;
+
+    return this.materializeArtifactRow(row);
+  }
+
+  private readArtifactsForSessionSync(sessionID: string): ArtifactData[] {
+    const rows = this.getDb()
+      .prepare(
+        'SELECT * FROM artifacts WHERE session_id = ? ORDER BY created_at ASC, artifact_id ASC',
+      )
+      .all(sessionID) as ArtifactRow[];
+
+    return rows.map((row) => this.materializeArtifactRow(row));
+  }
+
+  private readArtifactsForMessageSync(messageID: string): ArtifactData[] {
+    const rows = this.getDb()
+      .prepare(
+        'SELECT * FROM artifacts WHERE message_id = ? ORDER BY created_at ASC, artifact_id ASC',
+      )
+      .all(messageID) as ArtifactRow[];
+
+    return rows.map((row) => this.materializeArtifactRow(row));
+  }
+
+  private findExpandMatches(
+    sessionID: string,
+    query: string,
+  ): {
+    messageIDs: Set<string>;
+    nodeIDs: Set<string>;
+    artifactIDs: Set<string>;
+  } {
+    const messageIDs = new Set<string>();
+    const nodeIDs = new Set<string>();
+    const artifactIDs = new Set<string>();
+    const ftsQuery = this.buildFtsQuery(query);
+    const db = this.getDb();
+
+    if (ftsQuery) {
+      try {
+        const messageRows = db
+          .prepare(
+            'SELECT message_id FROM message_fts WHERE session_id = ? AND message_fts MATCH ? LIMIT 200',
+          )
+          .all(sessionID, ftsQuery) as Array<{ message_id: string }>;
+        for (const row of messageRows) messageIDs.add(row.message_id);
+
+        const nodeRows = db
+          .prepare(
+            'SELECT node_id FROM summary_fts WHERE session_id = ? AND summary_fts MATCH ? LIMIT 200',
+          )
+          .all(sessionID, ftsQuery) as Array<{ node_id: string }>;
+        for (const row of nodeRows) nodeIDs.add(row.node_id);
+
+        const artifactRows = db
+          .prepare(
+            'SELECT artifact_id, message_id FROM artifact_fts WHERE session_id = ? AND artifact_fts MATCH ? LIMIT 200',
+          )
+          .all(sessionID, ftsQuery) as Array<{ artifact_id: string; message_id: string }>;
+        for (const row of artifactRows) {
+          artifactIDs.add(row.artifact_id);
+          messageIDs.add(row.message_id);
+        }
+      } catch (error) {
+        getLogger().debug('FTS query failed, falling back to scan', { query, error });
+      }
+    }
+
+    if (messageIDs.size === 0 && nodeIDs.size === 0 && artifactIDs.size === 0) {
+      const lower = query.toLowerCase();
+      const session = this.readSessionSync(sessionID);
+      for (const message of session.messages) {
+        const text = guessMessageText(
+          message,
+          this.options.interop.ignoreToolPrefixes,
+        ).toLowerCase();
+        if (text.includes(lower)) messageIDs.add(message.info.id);
+      }
+
+      for (const artifact of this.readArtifactsForSessionSync(sessionID)) {
+        if (`${artifact.previewText}\n${artifact.contentText}`.toLowerCase().includes(lower)) {
+          artifactIDs.add(artifact.artifactID);
+          messageIDs.add(artifact.messageID);
+        }
+      }
+
+      const summaryRows = db
+        .prepare(
+          'SELECT node_id, summary_text FROM summary_nodes WHERE session_id = ? ORDER BY created_at ASC',
+        )
+        .all(sessionID) as Array<{ node_id: string; summary_text: string }>;
+      for (const row of summaryRows) {
+        if (row.summary_text.toLowerCase().includes(lower)) nodeIDs.add(row.node_id);
+      }
+    }
+
+    return { messageIDs, nodeIDs, artifactIDs };
+  }
+
+  private nodeMatchesQuery(
+    node: SummaryNodeData,
+    matches: { messageIDs: Set<string>; nodeIDs: Set<string>; artifactIDs: Set<string> },
+  ): boolean {
+    if (matches.nodeIDs.has(node.nodeID)) return true;
+    if (node.messageIDs.some((messageID) => matches.messageIDs.has(messageID))) return true;
+    return this.readSummaryChildrenSync(node.nodeID).some((child) =>
+      this.nodeMatchesQuery(child, matches),
+    );
+  }
+
+  private renderRawMessagesForNode(
+    session: NormalizedSession,
+    node: SummaryNodeData,
+    messageLimit: number,
+    matches?: { messageIDs: Set<string>; nodeIDs: Set<string>; artifactIDs: Set<string> },
+    indent = '',
+  ): string[] {
+    const byID = new Map(session.messages.map((message) => [message.info.id, message]));
+    const allCovered = node.messageIDs
+      .map((messageID) => byID.get(messageID))
+      .filter((message): message is ConversationMessage => Boolean(message));
+
+    const filteredCovered =
+      matches && matches.messageIDs.size > 0
+        ? allCovered.filter((message) => matches.messageIDs.has(message.info.id))
+        : allCovered;
+    const covered = (filteredCovered.length > 0 ? filteredCovered : allCovered).slice(
+      0,
+      messageLimit,
+    );
+    if (covered.length === 0) return [];
+
+    const lines = [`${indent}Raw messages:`];
+    for (const message of covered) {
+      const snippet =
+        guessMessageText(message, this.options.interop.ignoreToolPrefixes) || '(no text content)';
+      lines.push(`${indent}- ${message.info.role} ${message.info.id}: ${truncate(snippet, 220)}`);
+      const artifacts = this.readArtifactsForMessageSync(message.info.id);
+      const shownArtifacts =
+        matches && matches.artifactIDs.size > 0
+          ? artifacts.filter((artifact) => matches.artifactIDs.has(artifact.artifactID))
+          : artifacts;
+      for (const artifact of shownArtifacts.slice(0, 4)) {
+        lines.push(
+          `${indent}  artifact ${artifact.artifactID} ${artifact.artifactKind}/${artifact.fieldName} (${artifact.charCount} chars): ${truncate(artifact.previewText, 120)}`,
+        );
+      }
+      if (shownArtifacts.length > 4) {
+        lines.push(`${indent}  ... ${shownArtifacts.length - 4} more artifact(s)`);
+      }
+    }
+
+    if (
+      (filteredCovered.length > 0 ? filteredCovered.length : allCovered.length) > covered.length
+    ) {
+      lines.push(
+        `${indent}- ... ${(filteredCovered.length > 0 ? filteredCovered.length : allCovered.length) - covered.length} more message(s)`,
+      );
+    }
+    return lines;
+  }
+
+  private collectTargetedNodeLines(
+    session: NormalizedSession,
+    node: SummaryNodeData,
+    depth: number,
+    includeRaw: boolean,
+    messageLimit: number,
+    matches: { messageIDs: Set<string>; nodeIDs: Set<string>; artifactIDs: Set<string> },
+    indent = '',
+  ): string[] {
+    const lines = [
+      `${indent}- ${node.nodeID} (level ${node.level}, messages ${node.startIndex + 1}-${node.endIndex + 1}): ${truncate(node.summaryText, 180)}`,
+    ];
+    const children = this.readSummaryChildrenSync(node.nodeID).filter((child) =>
+      this.nodeMatchesQuery(child, matches),
+    );
+
+    if (children.length > 0 && depth > 0) {
+      for (const child of children) {
+        lines.push(
+          ...this.collectTargetedNodeLines(
+            session,
+            child,
+            depth - 1,
+            includeRaw,
+            messageLimit,
+            matches,
+            `${indent}  `,
+          ),
+        );
+      }
+      return lines;
+    }
+
+    if (includeRaw) {
+      lines.push(
+        ...this.renderRawMessagesForNode(session, node, messageLimit, matches, `${indent}  `),
+      );
+    }
+    return lines;
+  }
+
+  private renderTargetedExpansion(
+    session: NormalizedSession,
+    node: SummaryNodeData,
+    depth: number,
+    includeRaw: boolean,
+    messageLimit: number,
+    query: string,
+    matches: { messageIDs: Set<string>; nodeIDs: Set<string>; artifactIDs: Set<string> },
+  ): string {
+    const lines = [
+      `Node: ${node.nodeID}`,
+      `Session: ${node.sessionID}`,
+      `Query: ${query}`,
+      `Level: ${node.level}`,
+      `Coverage: archived messages ${node.startIndex + 1}-${node.endIndex + 1}`,
+      `Summary: ${node.summaryText}`,
+      'Targeted descendants:',
+    ];
+
+    const children = this.readSummaryChildrenSync(node.nodeID).filter((child) =>
+      this.nodeMatchesQuery(child, matches),
+    );
+    if (children.length > 0) {
+      for (const child of children) {
+        lines.push(
+          ...this.collectTargetedNodeLines(
+            session,
+            child,
+            depth - 1,
+            includeRaw,
+            messageLimit,
+            matches,
+            '',
+          ),
+        );
+      }
+      return lines.join('\n');
+    }
+
+    lines.push(...this.renderRawMessagesForNode(session, node, messageLimit, matches));
+    return lines.join('\n');
+  }
+
+  private renderExpandedNode(
+    session: NormalizedSession,
+    node: SummaryNodeData,
+    depth: number,
+    includeRaw: boolean,
+    messageLimit: number,
+  ): string {
+    const children = this.readSummaryChildrenSync(node.nodeID);
+    const lines = [
+      `Node: ${node.nodeID}`,
+      `Session: ${node.sessionID}`,
+      `Level: ${node.level}`,
+      `Coverage: archived messages ${node.startIndex + 1}-${node.endIndex + 1}`,
+      `Summary: ${node.summaryText}`,
+    ];
+
+    if (children.length > 0) {
+      lines.push('Children:');
+      for (const child of children) {
+        lines.push(`- ${child.nodeID}: ${truncate(child.summaryText, 180)}`);
+      }
+
+      if (depth > 1) {
+        lines.push('Deeper descendants:');
+        for (const child of children) {
+          const grandChildren = this.readSummaryChildrenSync(child.nodeID);
+          for (const grandChild of grandChildren.slice(0, SUMMARY_BRANCH_FACTOR)) {
+            lines.push(
+              `- ${child.nodeID} -> ${grandChild.nodeID}: ${truncate(grandChild.summaryText, 160)}`,
+            );
+          }
+        }
+      }
+
+      return lines.join('\n');
+    }
+
+    if (!includeRaw) return lines.join('\n');
+
+    lines.push(...this.renderRawMessagesForNode(session, node, messageLimit));
+
+    return lines.join('\n');
+  }
+
+  private buildFtsQuery(query: string): string | undefined {
+    return buildFtsQuery(query);
+  }
+
+  private searchDeps() {
+    return {
+      getDb: () => this.getDb(),
+      readScopedSessionsSync: (sessionIDs?: string[]) => this.readScopedSessionsSync(sessionIDs),
+      readScopedSummaryRowsSync: (sessionIDs?: string[]) =>
+        this.readScopedSummaryRowsSync(sessionIDs),
+      readScopedArtifactRowsSync: (sessionIDs?: string[]) =>
+        this.readScopedArtifactRowsSync(sessionIDs),
+      buildArtifactSearchContent: (row: ArtifactRow) =>
+        this.buildArtifactSearchContent(this.materializeArtifactRow(row)),
+      ignoreToolPrefixes: this.options.interop.ignoreToolPrefixes,
+      guessMessageText: (message: ConversationMessage, ignorePrefixes: string[]) =>
+        guessMessageText(message, ignorePrefixes),
+    };
+  }
+
+  private artifactDeps() {
+    return {
+      workspaceDirectory: this.workspaceDirectory,
+      options: {
+        artifactPreviewChars: this.options.artifactPreviewChars,
+        binaryPreviewProviders: this.options.binaryPreviewProviders,
+        largeContentThreshold: this.options.largeContentThreshold,
+        previewBytePeek: this.options.previewBytePeek,
+        privacy: this.privacy,
+      },
+      getDb: () => this.getDb(),
+      readArtifactBlobSync: (contentHash?: string | null) => this.readArtifactBlobSync(contentHash),
+      upsertSessionRowSync: (session: NormalizedSession) => this.upsertSessionRowSync(session),
+      upsertMessageInfoSync: (sessionID: string, message: ConversationMessage) =>
+        this.upsertMessageInfoSync(sessionID, message),
+      deleteMessageSync: (sessionID: string, messageID: string) =>
+        this.deleteMessageSync(sessionID, messageID),
+      replaceMessageSearchRowSync: (sessionID: string, message: ConversationMessage) =>
+        this.replaceMessageSearchRowSync(sessionID, message),
+      replaceMessageSearchRowsSync: (session: NormalizedSession) =>
+        this.replaceMessageSearchRowsSync(session),
+    };
+  }
+
+  private searchWithFts(query: string, sessionIDs?: string[], limit = 5): SearchResult[] {
+    return searchWithFtsModule(this.searchDeps(), query, sessionIDs, limit);
+  }
+
+  private searchByScan(query: string, sessionIDs?: string[], limit = 5): SearchResult[] {
+    return searchByScanModule(this.searchDeps(), query, sessionIDs, limit);
+  }
+
+  private replaceMessageSearchRowsSync(session: NormalizedSession): void {
+    const sanitizedSession = this.sanitizeSessionMessages(session, 'replaceMessageSearchRowsSync');
+    replaceMessageSearchRowsModule(
+      this.searchDeps(),
+      redactStructuredValue(sanitizedSession, this.privacy),
+    );
+  }
+
+  private replaceMessageSearchRowSync(sessionID: string, message: ConversationMessage): void {
+    if (!getValidMessageInfo(message.info)) {
+      logMalformedMessage('Skipping malformed message search row', {
+        operation: 'replaceMessageSearchRowSync',
+        sessionID,
+      });
+      return;
+    }
+
+    replaceMessageSearchRowModule(
+      this.searchDeps(),
+      sessionID,
+      redactStructuredValue(message, this.privacy),
+    );
+  }
+
+  private refreshSearchIndexesSync(sessionIDs?: string[]): void {
+    refreshSearchIndexesModule(this.searchDeps(), sessionIDs);
+  }
+
+  private ensureSessionColumnsSync(): void {
+    const db = this.getDb();
+    const columns = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+    const names = new Set(columns.map((column) => column.name));
+
+    const ensure = (column: string, definition: string) => {
+      if (names.has(column)) return;
+      db.exec(`ALTER TABLE sessions ADD COLUMN ${definition}`);
+      names.add(column);
+    };
+
+    ensure('session_directory', 'session_directory TEXT');
+    ensure('worktree_key', 'worktree_key TEXT');
+    ensure('parent_session_id', 'parent_session_id TEXT');
+    ensure('root_session_id', 'root_session_id TEXT');
+    ensure('lineage_depth', 'lineage_depth INTEGER');
+    ensure('pinned', 'pinned INTEGER NOT NULL DEFAULT 0');
+    ensure('pin_reason', 'pin_reason TEXT');
+  }
+
+  private ensureSummaryStateColumnsSync(): void {
+    const db = this.getDb();
+    const columns = db.prepare('PRAGMA table_info(summary_state)').all() as Array<{ name: string }>;
+    const names = new Set(columns.map((column) => column.name));
+    if (names.has('archived_signature')) return;
+
+    db.exec("ALTER TABLE summary_state ADD COLUMN archived_signature TEXT NOT NULL DEFAULT ''");
+  }
+
+  private ensureSummaryNodeColumnsSync(): void {
+    const db = this.getDb();
+    const columns = db.prepare('PRAGMA table_info(summary_nodes)').all() as Array<{ name: string }>;
+    const names = new Set(columns.map((column) => column.name));
+    if (names.has('strategy')) return;
+
+    db.exec(
+      "ALTER TABLE summary_nodes ADD COLUMN strategy TEXT NOT NULL DEFAULT 'deterministic-v1'",
+    );
+  }
+
+  private ensureArtifactColumnsSync(): void {
+    const db = this.getDb();
+    const columns = db.prepare('PRAGMA table_info(artifacts)').all() as Array<{ name: string }>;
+    const names = new Set(columns.map((column) => column.name));
+
+    if (!names.has('metadata_json')) {
+      db.exec("ALTER TABLE artifacts ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}' ");
+      names.add('metadata_json');
+    }
+
+    if (!names.has('content_hash')) {
+      db.exec('ALTER TABLE artifacts ADD COLUMN content_hash TEXT');
+    }
+
+    const blobColumns = db.prepare('PRAGMA table_info(artifact_blobs)').all() as Array<{
+      name: string;
+    }>;
+    if (!blobColumns.some((column) => column.name === 'orphaned_at')) {
+      db.exec('ALTER TABLE artifact_blobs ADD COLUMN orphaned_at INTEGER');
+    }
+  }
+
+  private backfillArtifactBlobsSync(): void {
+    const db = this.getDb();
+    const rows = db
+      .prepare('SELECT * FROM artifacts ORDER BY created_at ASC, artifact_id ASC')
+      .all() as ArtifactRow[];
+    if (rows.length === 0) return;
+
+    const insertBlob = db.prepare(
+      `INSERT OR IGNORE INTO artifact_blobs (content_hash, content_text, char_count, created_at)
+       VALUES (?, ?, ?, ?)`,
+    );
+    const updateArtifact = db.prepare(
+      "UPDATE artifacts SET content_hash = ?, content_text = CASE WHEN content_text != '' THEN '' ELSE content_text END WHERE artifact_id = ?",
+    );
+
+    for (const row of rows) {
+      const contentText =
+        row.content_text || this.readArtifactBlobSync(row.content_hash)?.content_text || '';
+      if (!contentText) continue;
+      const contentHash = row.content_hash ?? hashContent(contentText);
+      insertBlob.run(contentHash, contentText, contentText.length, row.created_at);
+      if (row.content_hash !== contentHash || row.content_text !== '') {
+        updateArtifact.run(contentHash, row.artifact_id);
+      }
+    }
+  }
+
+  private refreshAllLineageSync(): void {
+    const db = this.getDb();
+    const rows = db.prepare('SELECT session_id, parent_session_id FROM sessions').all() as Array<{
+      session_id: string;
+      parent_session_id: string | null;
+    }>;
+    const byID = new Map(rows.map((row) => [row.session_id, row]));
+
+    const invalidParentSessionIDs = new Set<string>();
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+
+    const detectInvalidParents = (sessionID: string): void => {
+      if (visited.has(sessionID)) return;
+
+      visiting.add(sessionID);
+      const row = byID.get(sessionID);
+      const parentSessionID = row?.parent_session_id ?? undefined;
+
+      if (parentSessionID) {
+        if (parentSessionID === sessionID || visiting.has(parentSessionID)) {
+          invalidParentSessionIDs.add(sessionID);
+        } else if (byID.has(parentSessionID)) {
+          detectInvalidParents(parentSessionID);
+        }
+      }
+
+      visiting.delete(sessionID);
+      visited.add(sessionID);
+    };
+
+    for (const row of rows) detectInvalidParents(row.session_id);
+
+    if (invalidParentSessionIDs.size > 0) {
+      const clearParent = db.prepare(
+        'UPDATE sessions SET parent_session_id = NULL WHERE session_id = ?',
+      );
+      for (const sessionID of invalidParentSessionIDs) {
+        clearParent.run(sessionID);
+        const row = byID.get(sessionID);
+        if (row) row.parent_session_id = null;
+      }
+    }
+
+    const memo = new Map<string, { rootSessionID: string; lineageDepth: number }>();
+
+    const resolve = (sessionID: string): { rootSessionID: string; lineageDepth: number } => {
+      const existing = memo.get(sessionID);
+      if (existing) return existing;
+
+      const row = byID.get(sessionID);
+      let resolved: { rootSessionID: string; lineageDepth: number };
+
+      if (!row?.parent_session_id) {
+        resolved = { rootSessionID: sessionID, lineageDepth: 0 };
+      } else {
+        const parent = resolve(row.parent_session_id);
+        resolved = {
+          rootSessionID: parent.rootSessionID,
+          lineageDepth: parent.lineageDepth + 1,
+        };
+      }
+
+      memo.set(sessionID, resolved);
+      return resolved;
+    };
+
+    const update = db.prepare(
+      'UPDATE sessions SET root_session_id = ?, lineage_depth = ? WHERE session_id = ?',
+    );
+    for (const row of rows) {
+      const lineage = resolve(row.session_id);
+      update.run(lineage.rootSessionID, lineage.lineageDepth, row.session_id);
+    }
+  }
+
+  private resolveLineageSync(
+    sessionID: string,
+    parentSessionID?: string,
+  ): { rootSessionID: string; lineageDepth: number } {
+    if (!parentSessionID) return { rootSessionID: sessionID, lineageDepth: 0 };
+
+    const seen = new Set<string>([sessionID]);
+    let currentSessionID: string | undefined = parentSessionID;
+    let lineageDepth = 1;
+
+    while (currentSessionID && !seen.has(currentSessionID)) {
+      seen.add(currentSessionID);
+      const parent = this.getDb()
+        .prepare(
+          'SELECT parent_session_id, root_session_id, lineage_depth FROM sessions WHERE session_id = ?',
+        )
+        .get(currentSessionID) as
+        | {
+            parent_session_id: string | null;
+            root_session_id: string | null;
+            lineage_depth: number | null;
+          }
+        | undefined;
+
+      if (!parent) return { rootSessionID: currentSessionID, lineageDepth };
+      if (parent.root_session_id && parent.lineage_depth !== null) {
+        return {
+          rootSessionID: parent.root_session_id,
+          lineageDepth: parent.lineage_depth + lineageDepth,
+        };
+      }
+      if (!parent.parent_session_id) {
+        return { rootSessionID: currentSessionID, lineageDepth };
+      }
+
+      currentSessionID = parent.parent_session_id;
+      lineageDepth += 1;
+    }
+
+    return { rootSessionID: parentSessionID, lineageDepth };
+  }
+
+  private applyEvent(session: NormalizedSession, event: CapturedEvent): NormalizedSession {
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case 'session.created':
+      case 'session.updated':
+        session.title = payload.properties.info.title;
+        session.directory = payload.properties.info.directory;
+        session.parentSessionID = payload.properties.info.parentID ?? undefined;
+        session.deleted = false;
+        return session;
+      case 'session.deleted':
+        session.title = payload.properties.info.title;
+        session.directory = payload.properties.info.directory;
+        session.parentSessionID = payload.properties.info.parentID ?? session.parentSessionID;
+        session.deleted = true;
+        return session;
+      case 'session.compacted':
+        session.compactedAt = event.timestamp;
+        return session;
+      case 'message.updated': {
+        const existing = session.messages.find(
+          (message) => message.info.id === payload.properties.info.id,
+        );
+        if (existing) existing.info = payload.properties.info;
+        else {
+          session.messages.push({ info: payload.properties.info, parts: [] });
+          session.messages.sort(compareMessages);
+        }
+        return session;
+      }
+      case 'message.removed':
+        session.messages = session.messages.filter(
+          (message) => message.info.id !== payload.properties.messageID,
+        );
+        return session;
+      case 'message.part.updated': {
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.part.messageID,
+        );
+        if (!message) return session;
+
+        const existing = message.parts.findIndex((part) => part.id === payload.properties.part.id);
+        if (existing >= 0) message.parts[existing] = payload.properties.part;
+        else message.parts.push(payload.properties.part);
+        return session;
+      }
+      case 'message.part.removed': {
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.messageID,
+        );
+        if (!message) return session;
+        message.parts = message.parts.filter((part) => part.id !== payload.properties.partID);
+        return session;
+      }
+      default:
+        return session;
+    }
+  }
+
+  private getResumeSync(sessionID: string): string | undefined {
+    const row = safeQueryOne<{ note: string }>(
+      this.getDb().prepare('SELECT note FROM resumes WHERE session_id = ?'),
+      [sessionID],
+      'getResumeSync',
+    );
+    return row?.note;
+  }
+
+  private materializeSessionRow(
+    row: SessionRow,
+    messages: ConversationMessage[] = [],
+  ): NormalizedSession {
+    const parentSessionID = row.parent_session_id ?? undefined;
+    const derivedLineage =
+      row.root_session_id === null || row.lineage_depth === null
+        ? this.resolveLineageSync(row.session_id, parentSessionID)
+        : undefined;
+
+    return {
+      sessionID: row.session_id,
+      title: row.title ?? undefined,
+      directory: row.session_directory ?? undefined,
+      parentSessionID,
+      rootSessionID: row.root_session_id ?? derivedLineage?.rootSessionID,
+      lineageDepth: row.lineage_depth ?? derivedLineage?.lineageDepth,
+      pinned: Boolean(row.pinned),
+      pinReason: row.pin_reason ?? undefined,
+      updatedAt: row.updated_at,
+      compactedAt: row.compacted_at ?? undefined,
+      deleted: Boolean(row.deleted),
+      eventCount: row.event_count,
+      messages,
+    };
+  }
+
+  private readSessionHeaderSync(sessionID: string): NormalizedSession | undefined {
+    const row = safeQueryOne<SessionRow>(
+      this.getDb().prepare('SELECT * FROM sessions WHERE session_id = ?'),
+      [sessionID],
+      'readSessionHeaderSync',
+    );
+    if (!row) return undefined;
+
+    return this.materializeSessionRow(row);
+  }
+
+  private clearSessionDataSync(sessionID: string): void {
+    const db = this.getDb();
+    db.prepare('DELETE FROM message_fts WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM summary_fts WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM artifact_fts WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM artifacts WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM summary_edges WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM summary_nodes WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM summary_state WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM resumes WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM parts WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM messages WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM events WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM sessions WHERE session_id = ?').run(sessionID);
+  }
+
+  private readChildSessionsSync(sessionID: string): NormalizedSession[] {
+    const rows = this.getDb()
+      .prepare(
+        'SELECT session_id FROM sessions WHERE parent_session_id = ? ORDER BY updated_at DESC',
+      )
+      .all(sessionID) as Array<{ session_id: string }>;
+    return rows
+      .map((row) => this.readSessionHeaderSync(row.session_id))
+      .filter((row): row is NormalizedSession => Boolean(row));
+  }
+
+  private readLineageChainSync(sessionID: string): NormalizedSession[] {
+    const chain: NormalizedSession[] = [];
+    const seen = new Set<string>();
+    let currentID: string | undefined = sessionID;
+
+    while (currentID && !seen.has(currentID)) {
+      seen.add(currentID);
+      const session = this.readSessionHeaderSync(currentID);
+      if (!session) break;
+      chain.unshift(session);
+      currentID = session.parentSessionID;
+    }
+
+    return chain;
+  }
+
+  private readAllSessionsSync(): NormalizedSession[] {
+    const rows = this.getDb()
+      .prepare(
+        'SELECT session_id FROM sessions WHERE event_count > 0 OR updated_at > 0 ORDER BY updated_at DESC',
+      )
+      .all() as Array<{ session_id: string }>;
+    const sessionIDs = rows.map((row) => row.session_id);
+    if (sessionIDs.length <= 1) return sessionIDs.map((id) => this.readSessionSync(id));
+    return this.readSessionsBatchSync(sessionIDs);
+  }
+
+  private readSessionsBatchSync(sessionIDs: string[]): NormalizedSession[] {
+    const db = this.getDb();
+    const placeholders = sessionIDs.map(() => '?').join(', ');
+
+    // 1. Session headers (batch)
+    const sessionRows = db
+      .prepare(`SELECT * FROM sessions WHERE session_id IN (${placeholders})`)
+      .all(...sessionIDs) as SessionRow[];
+    const sessionMap = new Map<string, SessionRow>();
+    for (const row of sessionRows) sessionMap.set(row.session_id, row);
+
+    // 2. Messages (batch)
+    const messageRows = db
+      .prepare(
+        `SELECT * FROM messages WHERE session_id IN (${placeholders}) ORDER BY session_id ASC, created_at ASC, message_id ASC`,
+      )
+      .all(...sessionIDs) as MessageRow[];
+
+    // 3. Parts (batch)
+    const partRows = db
+      .prepare(
+        `SELECT * FROM parts WHERE session_id IN (${placeholders}) ORDER BY session_id ASC, message_id ASC, sort_key ASC, part_id ASC`,
+      )
+      .all(...sessionIDs) as PartRow[];
+
+    // 4. Artifacts (batch)
+    const artifactRows = db
+      .prepare(
+        `SELECT * FROM artifacts WHERE session_id IN (${placeholders}) ORDER BY created_at ASC, artifact_id ASC`,
+      )
+      .all(...sessionIDs) as ArtifactRow[];
+
+    // 5. Artifact blobs (batch)
+    const contentHashes = [
+      ...new Set(artifactRows.map((r) => r.content_hash).filter(Boolean) as string[]),
+    ];
+    const blobMap = new Map<string, ArtifactBlobRow>();
+    if (contentHashes.length > 0) {
+      const blobPlaceholders = contentHashes.map(() => '?').join(', ');
+      const blobRows = db
+        .prepare(`SELECT * FROM artifact_blobs WHERE content_hash IN (${blobPlaceholders})`)
+        .all(...contentHashes) as ArtifactBlobRow[];
+      for (const blob of blobRows) blobMap.set(blob.content_hash, blob);
+    }
+
+    // Group artifacts by part ID
+    const artifactsByPart = new Map<string, ArtifactData[]>();
+    for (const row of artifactRows) {
+      const contentHash = row.content_hash;
+      const blob = contentHash ? blobMap.get(contentHash) : undefined;
+      const contentText = blob?.content_text ?? row.content_text;
+      const artifact: ArtifactData = {
+        artifactID: row.artifact_id,
+        sessionID: row.session_id,
+        messageID: row.message_id,
+        partID: row.part_id,
+        artifactKind: row.artifact_kind,
+        fieldName: row.field_name,
+        previewText: row.preview_text,
+        contentText,
+        contentHash: contentHash ?? hashContent(contentText),
+        charCount: blob?.char_count ?? row.char_count,
+        createdAt: row.created_at,
+        metadata: parseArtifactMetadata(row, 'readSessionsBatchSync'),
+      };
+      const list = artifactsByPart.get(artifact.partID) ?? [];
+      list.push(artifact);
+      artifactsByPart.set(artifact.partID, list);
+    }
+
+    // Assemble parts per session+message
+    const partsBySessionMessage = new Map<string, Map<string, Part[]>>();
+    for (const partRow of partRows) {
+      const _messageKey = `${partRow.session_id}|${partRow.message_id}`;
+      let partsByMessage = partsBySessionMessage.get(partRow.session_id);
+      if (!partsByMessage) {
+        partsByMessage = new Map();
+        partsBySessionMessage.set(partRow.session_id, partsByMessage);
+      }
+      const part = parseStoredPart(partRow, 'readSessionsBatchSync');
+      if (!part) continue;
+      const artifacts = artifactsByPart.get(part.id) ?? [];
+      hydratePartFromArtifacts(part, artifacts);
+      const parts = partsByMessage.get(partRow.message_id) ?? [];
+      parts.push(part);
+      partsByMessage.set(partRow.message_id, parts);
+    }
+
+    // Group messages per session
+    const messagesBySession = new Map<string, Array<{ info: Message; parts: Part[] }>>();
+    for (const messageRow of messageRows) {
+      const sessionParts = partsBySessionMessage.get(messageRow.session_id);
+      const info = parseStoredMessageInfo(messageRow, 'readSessionsBatchSync');
+      if (!info) continue;
+      const messages = messagesBySession.get(messageRow.session_id) ?? [];
+      messages.push({
+        info,
+        parts: sessionParts?.get(messageRow.message_id) ?? [],
+      });
+      messagesBySession.set(messageRow.session_id, messages);
+    }
+
+    // Build NormalizedSession results
+    return sessionIDs.map((sessionID) => {
+      const row = sessionMap.get(sessionID);
+      const messages = filterValidConversationMessages(messagesBySession.get(sessionID) ?? [], {
+        operation: 'readSessionsBatchSync',
+        sessionID,
+      });
+      if (!row) {
+        return { ...emptySession(sessionID), messages };
+      }
+      return this.materializeSessionRow(row, messages);
+    });
+  }
+
+  private readSessionSync(sessionID: string): NormalizedSession {
+    const db = this.getDb();
+    const row = safeQueryOne<SessionRow>(
+      db.prepare('SELECT * FROM sessions WHERE session_id = ?'),
+      [sessionID],
+      'readSessionSync',
+    );
+    const messageRows = db
+      .prepare(
+        'SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC, message_id ASC',
+      )
+      .all(sessionID) as MessageRow[];
+    const partRows = db
+      .prepare(
+        'SELECT * FROM parts WHERE session_id = ? ORDER BY message_id ASC, sort_key ASC, part_id ASC',
+      )
+      .all(sessionID) as PartRow[];
+    const artifactsByPart = new Map<string, ArtifactData[]>();
+    for (const artifact of this.readArtifactsForSessionSync(sessionID)) {
+      const list = artifactsByPart.get(artifact.partID) ?? [];
+      list.push(artifact);
+      artifactsByPart.set(artifact.partID, list);
+    }
+
+    const partsByMessage = new Map<string, Part[]>();
+    for (const partRow of partRows) {
+      const parts = partsByMessage.get(partRow.message_id) ?? [];
+      const part = parseStoredPart(partRow, 'readSessionSync');
+      if (!part) continue;
+      const artifacts = artifactsByPart.get(part.id) ?? [];
+      hydratePartFromArtifacts(part, artifacts);
+      parts.push(part);
+      partsByMessage.set(partRow.message_id, parts);
+    }
+
+    const messages = filterValidConversationMessages(
+      messageRows
+        .map((messageRow) => {
+          const info = parseStoredMessageInfo(messageRow, 'readSessionSync');
+          if (!info) return undefined;
+          return {
+            info,
+            parts: partsByMessage.get(messageRow.message_id) ?? [],
+          };
+        })
+        .filter((message): message is { info: Message; parts: Part[] } => Boolean(message)),
+      { operation: 'readSessionSync', sessionID },
+    );
+
+    if (!row) {
+      return { ...emptySession(sessionID), messages };
+    }
+
+    return this.materializeSessionRow(row, messages);
+  }
+
+  private prepareSessionForPersistence(session: NormalizedSession): NormalizedSession {
+    const parentSessionID = this.sanitizeParentSessionIDSync(
+      session.sessionID,
+      session.parentSessionID,
+    );
+    const lineage = this.resolveLineageSync(session.sessionID, parentSessionID);
+    return {
+      ...session,
+      parentSessionID,
+      rootSessionID: lineage.rootSessionID,
+      lineageDepth: lineage.lineageDepth,
+    };
+  }
+
+  private sanitizeParentSessionIDSync(
+    sessionID: string,
+    parentSessionID?: string,
+  ): string | undefined {
+    if (!parentSessionID || parentSessionID === sessionID) return undefined;
+
+    const seen = new Set<string>([sessionID]);
+    let currentSessionID: string | undefined = parentSessionID;
+    while (currentSessionID) {
+      if (seen.has(currentSessionID)) return undefined;
+      seen.add(currentSessionID);
+      const row = this.getDb()
+        .prepare('SELECT parent_session_id FROM sessions WHERE session_id = ?')
+        .get(currentSessionID) as { parent_session_id: string | null } | undefined;
+      currentSessionID = row?.parent_session_id ?? undefined;
+    }
+
+    return parentSessionID;
+  }
+
+  private readSessionForCaptureSync(
+    event: CapturedEvent,
+    options?: ReadMessageOptions,
+  ): NormalizedSession {
+    const sessionID = event.sessionID;
+    if (!sessionID) return emptySession('');
+
+    const session = this.readSessionHeaderSync(sessionID) ?? emptySession(sessionID);
+    const payload = event.payload as Event;
+
+    switch (payload.type) {
+      case 'message.updated': {
+        const message = this.readMessageSync(sessionID, payload.properties.info.id, options);
+        if (message) session.messages = [message];
+        return session;
+      }
+      case 'message.part.updated': {
+        const message = this.readMessageSync(sessionID, payload.properties.part.messageID, options);
+        if (message) session.messages = [message];
+        return session;
+      }
+      case 'message.part.removed': {
+        const message = this.readMessageSync(sessionID, payload.properties.messageID, options);
+        if (message) session.messages = [message];
+        return session;
+      }
+      default:
+        return session;
+    }
+  }
+
+  private readMessageSync(
+    sessionID: string,
+    messageID: string,
+    options?: ReadMessageOptions,
+  ): ConversationMessage | undefined {
+    const db = this.getDb();
+    const row = safeQueryOne<MessageRow>(
+      db.prepare('SELECT * FROM messages WHERE session_id = ? AND message_id = ?'),
+      [sessionID, messageID],
+      'readMessageSync',
+    );
+    if (!row) return undefined;
+
+    const hydrateArtifacts = options?.hydrateArtifacts ?? true;
+    const artifactsByPart = new Map<string, ArtifactData[]>();
+    if (hydrateArtifacts) {
+      for (const artifact of this.readArtifactsForMessageSync(messageID)) {
+        const list = artifactsByPart.get(artifact.partID) ?? [];
+        list.push(artifact);
+        artifactsByPart.set(artifact.partID, list);
+      }
+    }
+
+    const parts = db
+      .prepare(
+        'SELECT * FROM parts WHERE session_id = ? AND message_id = ? ORDER BY sort_key ASC, part_id ASC',
+      )
+      .all(sessionID, messageID) as PartRow[];
+
+    const info = parseStoredMessageInfo(row, 'readMessageSync');
+    if (!info) return undefined;
+
+    return {
+      info,
+      parts: parts.flatMap((partRow) => {
+        const part = parseStoredPart(partRow, 'readMessageSync');
+        if (!part) return [];
+        if (hydrateArtifacts) hydratePartFromArtifacts(part, artifactsByPart.get(part.id) ?? []);
+        return [part];
+      }),
+    };
+  }
+
+  private readMessageCountSync(sessionID: string): number {
+    const row = this.getDb()
+      .prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?')
+      .get(sessionID) as { count: number };
+    return row.count;
+  }
+
+  private isMessageArchivedSync(sessionID: string, messageID: string, createdAt: number): boolean {
+    const row = this.getDb()
+      .prepare(
+        `SELECT COUNT(*) AS count
+         FROM messages
+         WHERE session_id = ?
+           AND (created_at > ? OR (created_at = ? AND message_id > ?))`,
+      )
+      .get(sessionID, createdAt, createdAt, messageID) as { count: number };
+    return row.count >= this.options.freshTailMessages;
+  }
+
+  private async persistCapturedSession(
+    session: NormalizedSession,
+    event: CapturedEvent,
+    recordEvent: boolean,
+  ): Promise<void> {
+    const payload = event.payload as Event;
+    const writeEvent = () => {
+      if (recordEvent) this.writeEvent(event);
+    };
+
+    switch (payload.type) {
+      case 'session.created':
+      case 'session.updated':
+      case 'session.deleted':
+      case 'session.compacted':
+        withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
+          this.upsertSessionRowSync(session);
+        });
+        return;
+      case 'message.updated': {
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.info.id,
+        );
+        withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
+          this.upsertSessionRowSync(session);
+          if (message) {
+            this.upsertMessageInfoSync(session.sessionID, message);
+            this.replaceMessageSearchRowSync(session.sessionID, message);
+          }
+        });
+        return;
+      }
+      case 'message.removed':
+        withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
+          this.upsertSessionRowSync(session);
+          this.deleteMessageSync(session.sessionID, payload.properties.messageID);
+        });
+        return;
+      case 'message.part.updated': {
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.part.messageID,
+        );
+        const preservedArtifacts = message
+          ? this.readArtifactsForMessageSync(message.info.id).filter(
+              (artifact) => artifact.partID !== payload.properties.part.id,
+            )
+          : [];
+        const externalized = message ? await this.externalizeMessage(message) : undefined;
+        withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
+          this.upsertSessionRowSync(session);
+          if (externalized) {
+            this.replaceStoredMessageSync(session.sessionID, externalized.storedMessage, [
+              ...preservedArtifacts,
+              ...externalized.artifacts,
+            ]);
+          }
+        });
+        return;
+      }
+      case 'message.part.removed': {
+        const message = session.messages.find(
+          (entry) => entry.info.id === payload.properties.messageID,
+        );
+        const preservedArtifacts = message
+          ? this.readArtifactsForMessageSync(message.info.id).filter(
+              (artifact) => artifact.partID !== payload.properties.partID,
+            )
+          : [];
+        const externalized = message ? await this.externalizeMessage(message) : undefined;
+        withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
+          this.upsertSessionRowSync(session);
+          if (externalized) {
+            this.replaceStoredMessageSync(session.sessionID, externalized.storedMessage, [
+              ...preservedArtifacts,
+              ...externalized.artifacts,
+            ]);
+          }
+        });
+        return;
+      }
+      default: {
+        const externalized = await this.externalizeSession(session);
+        withTransaction(this.getDb(), 'capture', () => {
+          writeEvent();
+          this.persistStoredSessionSync(externalized.storedSession, externalized.artifacts);
+        });
+      }
+    }
+  }
+
+  private async persistSession(session: NormalizedSession): Promise<void> {
+    const preparedSession = this.prepareSessionForPersistence(session);
+    const { storedSession, artifacts } = await this.externalizeSession(preparedSession);
+
+    withTransaction(this.getDb(), 'persistSession', () => {
+      this.persistStoredSessionSync(storedSession, artifacts);
+    });
+  }
+
+  private persistStoredSessionSync(
+    storedSession: NormalizedSession,
+    artifacts: ArtifactData[],
+  ): void {
+    persistStoredSessionSyncModule(this.artifactDeps(), storedSession, artifacts);
+  }
+
+  private upsertSessionRowSync(session: NormalizedSession): void {
+    const db = this.getDb();
+    const title = session.title ? redactText(session.title, this.privacy) : undefined;
+    const directory = session.directory ? redactText(session.directory, this.privacy) : undefined;
+    const pinReason = session.pinReason ? redactText(session.pinReason, this.privacy) : undefined;
+    const worktreeKey = normalizeWorktreeKey(directory);
+
+    db.prepare(
+      `INSERT INTO sessions (session_id, title, session_directory, worktree_key, parent_session_id, root_session_id, lineage_depth, pinned, pin_reason, updated_at, compacted_at, deleted, event_count)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         title = excluded.title,
+         session_directory = excluded.session_directory,
+         worktree_key = excluded.worktree_key,
+         parent_session_id = excluded.parent_session_id,
+         root_session_id = excluded.root_session_id,
+         lineage_depth = excluded.lineage_depth,
+         pinned = excluded.pinned,
+         pin_reason = excluded.pin_reason,
+         updated_at = excluded.updated_at,
+         compacted_at = excluded.compacted_at,
+         deleted = excluded.deleted,
+         event_count = excluded.event_count`,
+    ).run(
+      session.sessionID,
+      title ?? null,
+      directory ?? null,
+      worktreeKey ?? null,
+      session.parentSessionID ?? null,
+      session.rootSessionID ?? session.sessionID,
+      session.lineageDepth ?? 0,
+      session.pinned ? 1 : 0,
+      pinReason ?? null,
+      session.updatedAt,
+      session.compactedAt ?? null,
+      session.deleted ? 1 : 0,
+      session.eventCount,
+    );
+  }
+
+  private upsertMessageInfoSync(sessionID: string, message: ConversationMessage): void {
+    const validated = getValidMessageInfo(message.info);
+    if (!validated) {
+      logMalformedMessage('Skipping malformed message metadata', {
+        operation: 'upsertMessageInfoSync',
+        sessionID,
+      });
+      return;
+    }
+
+    const info = redactStructuredValue(validated, this.privacy);
+    this.getDb()
+      .prepare(
+        `INSERT INTO messages (message_id, session_id, created_at, info_json)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(message_id) DO UPDATE SET
+            session_id = excluded.session_id,
+            created_at = excluded.created_at,
+            info_json = excluded.info_json`,
+      )
+      .run(info.id, sessionID, info.time.created, JSON.stringify(info));
+  }
+
+  private deleteMessageSync(sessionID: string, messageID: string): void {
+    const db = this.getDb();
+    db.prepare('DELETE FROM artifact_fts WHERE message_id = ?').run(messageID);
+    db.prepare('DELETE FROM message_fts WHERE message_id = ?').run(messageID);
+    db.prepare('DELETE FROM artifacts WHERE session_id = ? AND message_id = ?').run(
+      sessionID,
+      messageID,
+    );
+    db.prepare('DELETE FROM parts WHERE session_id = ? AND message_id = ?').run(
+      sessionID,
+      messageID,
+    );
+    db.prepare('DELETE FROM messages WHERE session_id = ? AND message_id = ?').run(
+      sessionID,
+      messageID,
+    );
+  }
+
+  private replaceStoredMessageSync(
+    sessionID: string,
+    storedMessage: ConversationMessage,
+    artifacts: ArtifactData[],
+  ): void {
+    replaceStoredMessageSyncModule(this.artifactDeps(), sessionID, storedMessage, artifacts);
+  }
+
+  private async externalizeMessage(message: ConversationMessage): Promise<ExternalizedMessage> {
+    return externalizeMessageModule(this.artifactDeps(), message);
+  }
+
+  private formatArtifactMetadataLines(metadata: Record<string, unknown>): string[] {
+    return formatArtifactMetadataLinesModule(metadata);
+  }
+
+  private buildArtifactSearchContent(artifact: ArtifactData): string {
+    return buildArtifactSearchContentModule(artifact);
+  }
+
+  private async externalizeSession(session: NormalizedSession): Promise<ExternalizedSession> {
+    return externalizeSessionModule(
+      this.artifactDeps(),
+      this.sanitizeSessionMessages(session, 'externalizeSession'),
+    );
+  }
+
+  private writeEvent(event: CapturedEvent): void {
+    const payloadStub =
+      event.type.startsWith('message.') || event.type.startsWith('session.')
+        ? `[${event.type}]`
+        : '';
+    this.getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO events (id, session_id, event_type, ts, payload_json)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(event.id, event.sessionID ?? null, event.type, event.timestamp, payloadStub);
+  }
+
+  private clearSummaryGraphSync(sessionID: string): void {
+    const db = this.getDb();
+    db.prepare('DELETE FROM summary_fts WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM summary_edges WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM summary_nodes WHERE session_id = ?').run(sessionID);
+    db.prepare('DELETE FROM summary_state WHERE session_id = ?').run(sessionID);
+  }
+
+  private latestSessionIDSync(): string | undefined {
+    const row = this.getDb()
+      .prepare(
+        'SELECT session_id FROM sessions WHERE event_count > 0 ORDER BY updated_at DESC LIMIT 1',
+      )
+      .get() as { session_id: string } | undefined;
+    return row?.session_id;
+  }
+
+  private async migrateLegacyArtifacts(): Promise<void> {
+    const db = this.getDb();
+    const existing = db.prepare('SELECT COUNT(*) AS count FROM sessions').get() as {
+      count: number;
+    };
+    if (existing.count > 0) return;
+
+    const sessionsDir = path.join(this.baseDir, 'sessions');
+    try {
+      const entries = await readdir(sessionsDir);
+      for (const entry of entries.filter((item) => item.endsWith('.json'))) {
+        const content = await readFile(path.join(sessionsDir, entry), 'utf8');
+        const session = parseJson<NormalizedSession>(content);
+        await this.persistSession(session);
+      }
+    } catch (error) {
+      if (!hasErrorCode(error, 'ENOENT')) {
+        getLogger().debug('Legacy session snapshot migration skipped', { error });
+      }
+    }
+
+    const resumePath = path.join(this.baseDir, 'resume.json');
+    try {
+      const content = await readFile(resumePath, 'utf8');
+      const resumes = parseJson<ResumeMap>(content);
+      const insertResume = db.prepare(
+        `INSERT INTO resumes (session_id, note, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET note = excluded.note, updated_at = excluded.updated_at`,
+      );
+      const now = Date.now();
+      for (const [sessionID, note] of Object.entries(resumes)) {
+        insertResume.run(sessionID, note, now);
+      }
+    } catch (error) {
+      if (!hasErrorCode(error, 'ENOENT')) {
+        getLogger().debug('Legacy resume migration skipped', { error });
+      }
+    }
+
+    const eventsPath = path.join(this.baseDir, 'events.jsonl');
+    try {
+      const content = await readFile(eventsPath, 'utf8');
+      for (const line of content.split('\n').filter(Boolean)) {
+        try {
+          const event = parseJson<CapturedEvent>(line);
+          this.writeEvent(event);
+        } catch (error) {
+          getLogger().debug('Malformed legacy event line skipped', { error });
+        }
+      }
+    } catch (error) {
+      if (!hasErrorCode(error, 'ENOENT')) {
+        getLogger().debug('Legacy event migration skipped', { error });
+      }
+    }
+  }
+
+  private getDb(): SqlDatabaseLike {
+    if (!this.db) {
+      throw new Error(
+        'LCM store database not ready. Call store.init() before any store operation.',
+      );
+    }
+    return this.db;
+  }
+}
+
+export {
+  assertSupportedSchemaVersionSync,
+  readAllSessions,
+  readArtifact,
+  readArtifactBlob,
+  readArtifactsForSession,
+  readChildSessions,
+  readLatestSessionID,
+  readLineageChain,
+  readMessagesForSession,
+  readSchemaVersionSync,
+  readSessionHeader,
+  readSessionStats,
+  writeSchemaVersionSync,
+};

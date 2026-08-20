@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-tests/
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
+.lcm/
+.opencode/
+*.dll
+*.node
+.lcm-snapshot.json
+.tmp-bench-*/
+.lcm-export-*/
+*.png

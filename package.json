@@ -1,0 +1,24 @@
+{
+  "name": "omp-lcm",
+  "version": "0.1.0",
+  "description": "Lossless context memory extension for omp",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "omp": {
+    "extensions": ["./src/omp/extension.ts"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src tests",
+    "format": "biome format --write src tests",
+    "test": "tsc -p tests/tsconfig.json && node --test tests/*.test.mjs dist-tests/*.test.js"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.10",
+    "@types/node": "25.5.0",
+    "typescript": "5.8.3"
+  }
+}
