@@ -707,7 +707,7 @@ function normalizeSqliteRuntimeOverride(value: string | undefined): SqliteRuntim
 
 export function resolveSqliteRuntimeCandidates(options?: SqliteRuntimeOptions): SqliteRuntime[] {
   const override = normalizeSqliteRuntimeOverride(
-    options?.envOverride ?? process.env.OPENCODE_LCM_SQLITE_RUNTIME,
+    options?.envOverride ?? process.env.OMP_LCM_SQLITE_RUNTIME,
   );
   if (override !== 'auto') return [override];
 

@@ -37,5 +37,5 @@ export function getLogger(): Logger {
 
 export function isStartupLoggingEnabled(): boolean {
   if (typeof process !== 'object' || !process?.env) return false;
-  return isTruthyEnvFlag(process.env.OPENCODE_LCM_STARTUP_LOG);
+  return isTruthyEnvFlag(process.env.OMP_LCM_STARTUP_LOG);
 }

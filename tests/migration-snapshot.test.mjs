@@ -84,12 +84,12 @@ test('init migrates legacy session, resume, and event files into SQLite', async 
 test('fresh init skips missing legacy files without logging', async () => {
   const workspace = makeWorkspace('lcm-fresh');
   const defaultLogger = getLogger();
-  const previousStartupLog = process.env.OPENCODE_LCM_STARTUP_LOG;
+  const previousStartupLog = process.env.OMP_LCM_STARTUP_LOG;
   const calls = [];
   let store;
 
   try {
-    delete process.env.OPENCODE_LCM_STARTUP_LOG;
+    delete process.env.OMP_LCM_STARTUP_LOG;
     setLogger({
       debug(message, context) {
         calls.push({ level: 'debug', message, context });
@@ -115,8 +115,8 @@ test('fresh init skips missing legacy files without logging', async () => {
   } finally {
     store?.close();
     setLogger(defaultLogger);
-    if (previousStartupLog === undefined) delete process.env.OPENCODE_LCM_STARTUP_LOG;
-    else process.env.OPENCODE_LCM_STARTUP_LOG = previousStartupLog;
+    if (previousStartupLog === undefined) delete process.env.OMP_LCM_STARTUP_LOG;
+    else process.env.OMP_LCM_STARTUP_LOG = previousStartupLog;
     await cleanupWorkspace(workspace);
   }
 });

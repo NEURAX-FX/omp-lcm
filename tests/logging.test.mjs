@@ -71,23 +71,23 @@ test('setLogger swaps the logger', () => {
   setLogger(defaultLogger);
 });
 
-test('isStartupLoggingEnabled respects OPENCODE_LCM_STARTUP_LOG', () => {
-  const previous = process.env.OPENCODE_LCM_STARTUP_LOG;
+test('isStartupLoggingEnabled respects OMP_LCM_STARTUP_LOG', () => {
+  const previous = process.env.OMP_LCM_STARTUP_LOG;
 
   try {
-    delete process.env.OPENCODE_LCM_STARTUP_LOG;
+    delete process.env.OMP_LCM_STARTUP_LOG;
     assert.equal(isStartupLoggingEnabled(), false);
 
-    process.env.OPENCODE_LCM_STARTUP_LOG = '1';
+    process.env.OMP_LCM_STARTUP_LOG = '1';
     assert.equal(isStartupLoggingEnabled(), true);
 
-    process.env.OPENCODE_LCM_STARTUP_LOG = 'true';
+    process.env.OMP_LCM_STARTUP_LOG = 'true';
     assert.equal(isStartupLoggingEnabled(), true);
 
-    process.env.OPENCODE_LCM_STARTUP_LOG = 'off';
+    process.env.OMP_LCM_STARTUP_LOG = 'off';
     assert.equal(isStartupLoggingEnabled(), false);
   } finally {
-    if (previous === undefined) delete process.env.OPENCODE_LCM_STARTUP_LOG;
-    else process.env.OPENCODE_LCM_STARTUP_LOG = previous;
+    if (previous === undefined) delete process.env.OMP_LCM_STARTUP_LOG;
+    else process.env.OMP_LCM_STARTUP_LOG = previous;
   }
 });

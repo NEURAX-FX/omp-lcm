@@ -32,7 +32,6 @@ const BASE_OPTIONS = {
   artifactViewChars: 1200,
   binaryPreviewProviders: ['fingerprint'],
   previewBytePeek: 8,
-  runtimeSafety: { allowUnsafeBunWindows: false },
 };
 
 export function makeWorkspace(prefix) {
@@ -78,7 +77,6 @@ export function makeOptions(overrides = {}) {
       },
     },
     binaryPreviewProviders: overrides.binaryPreviewProviders ?? BASE_OPTIONS.binaryPreviewProviders,
-    runtimeSafety: { ...BASE_OPTIONS.runtimeSafety, ...overrides.runtimeSafety },
   };
 }
 
