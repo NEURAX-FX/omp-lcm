@@ -9,7 +9,9 @@ import { runBinaryPreviewProviders } from '../dist/preview-providers.js';
 
 type PreviewContext = Parameters<typeof runBinaryPreviewProviders>[0];
 type FilePart = PreviewContext['file'];
-type FileSource = Extract<NonNullable<FilePart['source']>, { type: 'file' }>;
+// `source` is a single permissive shape in the ported wire types, so it is used
+// directly rather than extracted from a union by a `type: 'file'` discriminant.
+type FileSource = NonNullable<FilePart['source']>;
 
 function makeWorkspace(prefix: string): string {
   return mkdtempSync(path.join(tmpdir(), `${prefix}-`));

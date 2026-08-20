@@ -3,7 +3,7 @@ import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:
 import { homedir } from 'node:os';
 import path from 'node:path';
 
-import type { Event, Message, Part } from '@opencode-ai/sdk';
+import type { Event, Message, Part } from './wire-types.js';
 
 import {
   buildActiveSummaryText,

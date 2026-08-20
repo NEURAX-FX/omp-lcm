@@ -12,9 +12,10 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
     "lint": "biome check src tests",
     "format": "biome format --write src tests",
-    "test": "tsc -p tests/tsconfig.json && node --test tests/*.test.mjs dist-tests/*.test.js"
+    "test": "bun run build && tsc -p tests/tsconfig.json && node --test tests/*.test.mjs dist-tests/*.test.js"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.10",

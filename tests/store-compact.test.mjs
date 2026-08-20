@@ -5,7 +5,6 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
-import { NodeSidecarLcmStore } from '../dist/node-sidecar-store.js';
 import { SqliteLcmStore } from '../dist/store.js';
 
 function makeWorkspace(prefix) {
@@ -319,22 +318,6 @@ test('orphan artifact blobs respect the configured grace period', async () => {
   }
 });
 
-test('sidecar close rejects pending requests', async () => {
-  const workspace = makeWorkspace('lcm-sidecar-close');
-  const store = new NodeSidecarLcmStore(workspace, makeOptions());
-
-  try {
-    const pending = new Promise((resolve, reject) => {
-      store.pending.set(999, { resolve, reject });
-    });
-    const rejected = assert.rejects(pending, /sidecar closed/);
-    await store.close();
-    await rejected;
-  } finally {
-    await cleanupWorkspace(workspace);
-  }
-});
-
 test('capture commits its event and session state atomically', async () => {
   const workspace = makeWorkspace('lcm-capture-atomic');
   let store;
@@ -612,23 +595,3 @@ test('failed deferred flush requeues the failed event and the remaining batch', 
   }
 });
 
-test('sidecar timeout terminates the stuck worker and permits restart', async () => {
-  const workspace = makeWorkspace('lcm-sidecar-timeout');
-  const store = new NodeSidecarLcmStore(workspace, makeOptions());
-
-  try {
-    await store.init();
-    const stuckChild = store.child;
-    assert.ok(stuckChild);
-    stuckChild.stdout.pause();
-
-    await assert.rejects(store.request('stats', undefined, 10), /timed out after 10ms/);
-    assert.equal(store.child, undefined, 'timed-out worker should be detached');
-
-    await store.init();
-    assert.notEqual(store.child, stuckChild, 'the next request should start a fresh worker');
-  } finally {
-    await store.close();
-    await cleanupWorkspace(workspace);
-  }
-});

@@ -1,4 +1,4 @@
-import type { Message, Part } from '@opencode-ai/sdk';
+import type { Message, Part } from './wire-types.js';
 
 export type InteropOptions = {
   contextMode: boolean;

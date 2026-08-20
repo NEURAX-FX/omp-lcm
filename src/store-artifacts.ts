@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import type { Message, Part } from '@opencode-ai/sdk';
+import type { Message, Part } from './wire-types.js';
 import { getLogger } from './logging.js';
 import { runBinaryPreviewProviders } from './preview-providers.js';
 import {

@@ -1,4 +1,4 @@
-import type { Event } from '@opencode-ai/sdk';
+import type { Event } from './wire-types.js';
 
 import type { ConversationMessage, SearchResult, StoreStats } from './types.js';
 

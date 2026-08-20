@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
-import type { Part } from '@opencode-ai/sdk';
+import type { Part } from './wire-types.js';
 
 import { getLogger } from './logging.js';
 import { resolveWorkspacePath } from './workspace-path.js';
