@@ -5,6 +5,8 @@ Lossless context memory for [omp](https://omp.sh). Archives session history into
 relevant parts back into the prompt when a later turn needs them.
 
 Ported from [opencode-lcm](https://github.com/Plutarch01/opencode-lcm) (MIT).
+Substantial portions of the archive, summary, search, and retention logic are
+reused from it unmodified; both copyright notices are retained in `LICENSE`.
 
 ## Install
 

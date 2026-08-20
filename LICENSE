@@ -3,11 +3,6 @@ MIT License
 Copyright (c) 2026 omp-lcm contributors
 Copyright (c) 2026 OpenCode LCM contributors
 
-This project is a port of opencode-lcm (https://github.com/Plutarch01/opencode-lcm),
-which is MIT licensed. Substantial portions of the archive, summary, search, and
-retention logic are reused from it unmodified; the original copyright notice is
-retained above.
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
