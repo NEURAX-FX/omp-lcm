@@ -1,6 +1,4 @@
 import { randomUUID } from 'node:crypto';
-
-import type { Message, Part } from './wire-types.js';
 import { getLogger } from './logging.js';
 import { runBinaryPreviewProviders } from './preview-providers.js';
 import {
@@ -28,6 +26,7 @@ import {
   sanitizeAutomaticRetrievalSourceText,
   truncate,
 } from './utils.js';
+import type { Message, Part } from './wire-types.js';
 
 export type ArtifactData = {
   artifactID: string;

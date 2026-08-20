@@ -120,9 +120,7 @@ export function toConversationMessage(
     if (value !== undefined && value !== null) infoFields[key] = value;
   }
 
-  const parts = blocksOf(record.content).map((block, index) =>
-    toPart(sessionID, id, index, block),
-  );
+  const parts = blocksOf(record.content).map((block, index) => toPart(sessionID, id, index, block));
 
   return { info, parts };
 }

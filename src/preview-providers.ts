@@ -1,9 +1,7 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-
-import type { Part } from './wire-types.js';
-
 import { getLogger } from './logging.js';
+import type { Part } from './wire-types.js';
 import { resolveWorkspacePath } from './workspace-path.js';
 
 type FilePart = Extract<Part, { type: 'file' }>;

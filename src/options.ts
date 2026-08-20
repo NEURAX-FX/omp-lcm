@@ -61,7 +61,6 @@ export const DEFAULT_SUMMARY_V2: SummaryV2Options = {
   perMessageBudget: 110,
 };
 
-
 export const DEFAULT_OPTIONS: OpencodeLcmOptions = {
   interop: DEFAULT_INTEROP,
   scopeDefaults: DEFAULT_SCOPE_DEFAULTS,

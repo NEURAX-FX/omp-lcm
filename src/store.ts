@@ -2,9 +2,6 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import path from 'node:path';
-
-import type { Event, Message, Part } from './wire-types.js';
-
 import {
   buildActiveSummaryText,
   renderAutomaticRetrievalContext,
@@ -92,6 +89,7 @@ import {
   tokenizeQuery,
   truncate,
 } from './utils.js';
+import type { Event, Message, Part } from './wire-types.js';
 import { normalizeWorktreeKey } from './worktree-key.js';
 
 type ResumeMap = Record<string, string>;

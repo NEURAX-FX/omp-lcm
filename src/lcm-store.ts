@@ -1,6 +1,5 @@
-import type { Event } from './wire-types.js';
-
 import type { ConversationMessage, SearchResult, StoreStats } from './types.js';
+import type { Event } from './wire-types.js';
 
 export type GrepInput = {
   query: string;

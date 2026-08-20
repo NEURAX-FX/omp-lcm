@@ -594,4 +594,3 @@ test('failed deferred flush requeues the failed event and the remaining batch', 
     await cleanupWorkspace(workspace);
   }
 });
-

@@ -62,7 +62,6 @@ export type SummaryV2Options = {
   perMessageBudget: number;
 };
 
-
 export type OpencodeLcmOptions = {
   interop: InteropOptions;
   scopeDefaults: ScopeDefaults;
