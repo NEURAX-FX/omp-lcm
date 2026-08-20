@@ -11,6 +11,7 @@ import type {
   HostLogger,
   HostMessageEndEvent,
 } from './host.js';
+import { createPendingToolCalls } from './pending-tools.js';
 import { registerLcmTools } from './tools.js';
 
 export type LcmRuntime = {
@@ -33,6 +34,7 @@ export type LcmRuntime = {
  */
 export function createRuntime(deps: { store: LcmStore; logger: HostLogger }): LcmRuntime {
   const { store, logger } = deps;
+  const pending = createPendingToolCalls();
   let started = false;
   let degraded = false;
   let closed = false;
@@ -88,7 +90,7 @@ export function createRuntime(deps: { store: LcmStore; logger: HostLogger }): Lc
     async onMessageEnd(ctx, message) {
       if (!active()) return;
       await guard('message capture', async () => {
-        for (const event of messageEvents(ctx.sessionManager.getSessionId(), [message])) {
+        for (const event of messageEvents(ctx.sessionManager.getSessionId(), [message], pending)) {
           await store.captureDeferred(event);
         }
       });

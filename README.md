@@ -84,6 +84,7 @@ context event ◀── src/omp/extension.ts ◀── store.transformMessages()
 | `src/omp/adapter-events.ts` | omp lifecycle events → opencode capture events |
 | `src/omp/adapter-messages.ts` | `AgentMessage` ⇄ `ConversationMessage`, both directions |
 | `src/omp/ids.ts` | Stable message/part id synthesis |
+| `src/omp/pending-tools.ts` | Open tool calls awaiting their result |
 | `src/omp/config.ts` | Layered config loading |
 | `src/omp/tools.ts` | The 18 tool definitions |
 | `src/omp/host.ts` | Structural types for the host API slice used |
@@ -94,6 +95,13 @@ context event ◀── src/omp/extension.ts ◀── store.transformMessages()
 - **Archives on `message_end`.** omp has no unified event bus and no part-level
   delta events, so only settled messages are captured. The store already ignored
   `message.part.delta`, so nothing is lost.
+- **Tool calls and their results are re-joined across events.** opencode models a
+  call and its result as one part; omp delivers them as two separate messages.
+  `src/omp/pending-tools.ts` remembers where each unsettled call was archived so
+  the result updates that same part. Without it a tool part would stay
+  `status: "pending"` forever, its output would be archived as an unrelated text
+  part, and the store's tool-output privacy redaction — which is keyed on a
+  settled tool part — would never fire.
 - **Recall runs in the `context` event** and returns a replacement message array.
   omp hands handlers a deep copy, so in-place rewriting would be discarded.
 - **The system hint rides in as a `developer` message.** omp has no equivalent of
